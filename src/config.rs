@@ -533,6 +533,9 @@ mod tests {
         let manifest = build_launcher_manifest();
         assert_eq!(manifest.id, "launcher");
         assert_eq!(manifest.config_format, ConfigFormat::Toml);
+        let toml_str = toml::to_string_pretty(&manifest).unwrap();
+        let parsed: ModuleManifest = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.id, "launcher");
 
         let mut updates = HashMap::new();
         updates.insert(

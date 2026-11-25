@@ -9,16 +9,15 @@ use noren_sdk::theme::{load_theme, ResolvedTheme, ThemeMaterial};
 use noren_sdk::NipEvent;
 use serde_json::json;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{
-    HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
-};
+use windows::Win32::Foundation::{HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
-    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_CLIP,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1BitmapBrush, ID2D1Factory, ID2D1HwndRenderTarget,
+    ID2D1SolidColorBrush, D2D1_BITMAP_BRUSH_PROPERTIES, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+    D2D1_BITMAP_PROPERTIES, D2D1_BRUSH_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_CLIP,
+    D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
     D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
     D2D1_ROUNDED_RECT,
 };
@@ -34,7 +33,7 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Gdi::{InvalidateRect, ScreenToClient};
+use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::System::DataExchange::{
     CloseClipboard, GetClipboardData, OpenClipboard,
 };
@@ -48,13 +47,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, LoadCursorW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, TranslateMessage, HWND_TOPMOST, IDC_ARROW, MSG, SPI_GETWORKAREA,
-    SWP_NOACTIVATE, SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, LoadCursorW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowPos,
+    ShowWindow, SystemParametersInfoW, TranslateMessage, HWND_TOPMOST, IDC_ARROW, MSG,
+    SPI_GETWORKAREA, SWP_NOACTIVATE, SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCHAR,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
+use windows_numerics::Matrix3x2;
 
 use crate::actions::{
     open_url_in_browser, run_external_wallpaper_command, run_power_action, set_autostart,
@@ -69,23 +70,38 @@ use crate::nip::{
 use crate::search::{
     detect_mode, query_results, ConfirmationState, ItemEffect, RemoteAction, SearchItem, SearchMode,
 };
+use crate::wallpaper::{
+    apply_wallpaper, scan_wallpaper_folder, ThumbCache, WallpaperScan, THUMB_BYTES, THUMB_H,
+    THUMB_W,
+};
 
 pub const WM_APP_TOGGLE: u32 = WM_APP + 1;
 pub const WM_APP_APPS_LOADED: u32 = WM_APP + 2;
 pub const WM_APP_ICON_READY: u32 = WM_APP + 3;
+pub const WM_APP_WALLPAPERS_LOADED: u32 = WM_APP + 4;
+pub const WM_APP_THUMB_READY: u32 = WM_APP + 5;
 
 const HOTKEY_TOGGLE_ID: i32 = 1;
+const TIMER_CAROUSEL_ANIM: usize = 2;
 const CF_UNICODETEXT_ID: u32 = 13;
 
 const SEARCH_BAR_H: f32 = 56.0;
 const ROW_H: f32 = 50.0;
 const LIST_PAD_Y: f32 = 8.0;
-const WALLPAPER_STUB_H: f32 = 180.0;
+
+pub const CAROUSEL_RADIUS: usize = 5;
+pub const CAROUSEL_CENTER_W: f32 = 320.0;
+pub const CAROUSEL_STRIP_W: f32 = 56.0;
+pub const CAROUSEL_SLOT_H: f32 = 180.0;
+pub const CAROUSEL_GAP: f32 = 8.0;
+pub const CAROUSEL_PANEL_H: f32 = 248.0;
+const CAROUSEL_ANIM_MS: f32 = 220.0;
+const WHEEL_COOLDOWN_MS: u128 = 90;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
     Search,
-    WallpaperPlaceholder,
+    Wallpaper,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +114,40 @@ pub struct PanelGeometry {
     pub visible_rows: usize,
 }
 
+pub fn carousel_radius_for(count: usize) -> usize {
+    if count <= 1 {
+        0
+    } else {
+        CAROUSEL_RADIUS.min((count - 1) / 2)
+    }
+}
+
+pub fn carousel_panel_width(count: usize) -> f32 {
+    if count == 0 {
+        520.0
+    } else {
+        (CAROUSEL_CENTER_W
+            + 2.0 * (carousel_radius_for(count) as f32) * (CAROUSEL_STRIP_W + CAROUSEL_GAP)
+            + 64.0)
+            .max(380.0)
+    }
+}
+
+/// Returns `(center_x, width, active_t)` in logical pixels for a slot at continuous offset `d`.
+pub fn carousel_slot_layout(d: f32) -> (f32, f32, f32) {
+    let first_x = CAROUSEL_CENTER_W * 0.5 + CAROUSEL_GAP + CAROUSEL_STRIP_W * 0.5;
+    if d.abs() < 1.0 {
+        let t = 1.0 - d.abs();
+        let w = CAROUSEL_STRIP_W + (CAROUSEL_CENTER_W - CAROUSEL_STRIP_W) * t;
+        let cx = d * first_x;
+        (cx, w, t)
+    } else {
+        let sign = if d >= 0.0 { 1.0 } else { -1.0 };
+        let cx = sign * (first_x + (d.abs() - 1.0) * (CAROUSEL_STRIP_W + CAROUSEL_GAP));
+        (cx, CAROUSEL_STRIP_W, 0.0)
+    }
+}
+
 /// Computes the Launcher position (centered horizontally, 25% down from work area top) and height.
 pub fn compute_panel_geometry(
     work: RECT,
@@ -108,24 +158,31 @@ pub fn compute_panel_geometry(
     query: &str,
     result_count: usize,
     view: View,
+    wallpaper_count: usize,
 ) -> PanelGeometry {
     let work_w = (work.right - work.left).max(320);
     let work_h = (work.bottom - work.top).max(240);
-    let w = (panel_width * dpi_scale).round().max(320.0) as i32;
-    let w = w.min(work_w - 32);
-    let x = work.left + (work_w - w) / 2;
     let y = work.top + work_h / 4;
 
-    if view == View::WallpaperPlaceholder {
+    if view == View::Wallpaper {
+        let w = (carousel_panel_width(wallpaper_count) * dpi_scale)
+            .round()
+            .max(320.0) as i32;
+        let w = w.min(work_w - 32);
+        let x = work.left + (work_w - w) / 2;
         return PanelGeometry {
             x,
             y,
             w,
-            h: (WALLPAPER_STUB_H * dpi_scale).round() as i32,
+            h: (CAROUSEL_PANEL_H * dpi_scale).round() as i32,
             show_list: false,
             visible_rows: 0,
         };
     }
+
+    let w = (panel_width * dpi_scale).round().max(320.0) as i32;
+    let w = w.min(work_w - 32);
+    let x = work.left + (work_w - w) / 2;
 
     let bar_h = (SEARCH_BAR_H * dpi_scale).round() as i32;
     if compact_mode && query.trim().is_empty() {
@@ -158,10 +215,13 @@ struct D2dResources {
     dwrite_factory: IDWriteFactory,
     target: Option<ID2D1HwndRenderTarget>,
     bitmaps: HashMap<String, ID2D1Bitmap>,
+    thumb_bitmaps: HashMap<u64, ID2D1Bitmap>,
     cached_scale_bits: u32,
     fmt_input: Option<IDWriteTextFormat>,
     fmt_title: Option<IDWriteTextFormat>,
     fmt_sub: Option<IDWriteTextFormat>,
+    fmt_title_center: Option<IDWriteTextFormat>,
+    fmt_sub_center: Option<IDWriteTextFormat>,
     fmt_glyph: Option<IDWriteTextFormat>,
     fmt_letter: Option<IDWriteTextFormat>,
 }
@@ -181,10 +241,13 @@ impl D2dResources {
             dwrite_factory,
             target: None,
             bitmaps: HashMap::new(),
+            thumb_bitmaps: HashMap::new(),
             cached_scale_bits: 0,
             fmt_input: None,
             fmt_title: None,
             fmt_sub: None,
+            fmt_title_center: None,
+            fmt_sub_center: None,
             fmt_glyph: None,
             fmt_letter: None,
         })
@@ -224,6 +287,10 @@ impl D2dResources {
         self.fmt_input = mk(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_NORMAL, 16.0, false);
         self.fmt_title = mk(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0, false);
         self.fmt_sub = mk(w!("Segoe UI Variable Small"), DWRITE_FONT_WEIGHT_NORMAL, 11.5, false);
+        self.fmt_title_center =
+            mk(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0, true);
+        self.fmt_sub_center =
+            mk(w!("Segoe UI Variable Small"), DWRITE_FONT_WEIGHT_NORMAL, 11.5, true);
         self.fmt_glyph = mk(w!("Segoe Fluent Icons"), DWRITE_FONT_WEIGHT_NORMAL, 16.0, true);
         self.fmt_letter = mk(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0, true);
     }
@@ -268,6 +335,7 @@ impl D2dResources {
 
     fn drop_target(&mut self) {
         self.bitmaps.clear();
+        self.thumb_bitmaps.clear();
         self.target = None;
     }
 
@@ -303,6 +371,76 @@ impl D2dResources {
         self.bitmaps.insert(app_id.to_string(), bmp.clone());
         Some(bmp)
     }
+
+    fn bitmap_for_thumb(
+        &mut self,
+        rt: &ID2D1HwndRenderTarget,
+        cache_key: u64,
+        pixels: &[u8; THUMB_BYTES],
+    ) -> Option<ID2D1Bitmap> {
+        if let Some(bmp) = self.thumb_bitmaps.get(&cache_key) {
+            return Some(bmp.clone());
+        }
+        let bmp_props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        let bmp = unsafe {
+            rt.CreateBitmap(
+                D2D_SIZE_U {
+                    width: THUMB_W,
+                    height: THUMB_H,
+                },
+                Some(pixels.as_ptr() as *const c_void),
+                THUMB_W * 4,
+                &bmp_props,
+            )
+            .ok()?
+        };
+        if self.thumb_bitmaps.len() >= 40 {
+            if let Some(&first_key) = self.thumb_bitmaps.keys().next() {
+                self.thumb_bitmaps.remove(&first_key);
+            }
+        }
+        self.thumb_bitmaps.insert(cache_key, bmp.clone());
+        Some(bmp)
+    }
+}
+
+struct WallpaperState {
+    loading: bool,
+    scan: Option<WallpaperScan>,
+    virtual_idx: i64,
+    anim_start_val: f32,
+    anim_target_val: f32,
+    anim_current: f32,
+    anim_started_at: Instant,
+    anim_active: bool,
+    hovered_v: Option<i64>,
+    last_wheel_at: Instant,
+    from_search: bool,
+}
+
+impl Default for WallpaperState {
+    fn default() -> Self {
+        Self {
+            loading: false,
+            scan: None,
+            virtual_idx: 0,
+            anim_start_val: 0.0,
+            anim_target_val: 0.0,
+            anim_current: 0.0,
+            anim_started_at: Instant::now(),
+            anim_active: false,
+            hovered_v: None,
+            last_wheel_at: Instant::now(),
+            from_search: false,
+        }
+    }
 }
 
 struct AppState {
@@ -313,6 +451,8 @@ struct AppState {
     apps_loaded: bool,
     frecency: FrecencyStore,
     icons: IconCache,
+    thumbs: ThumbCache,
+    wp: WallpaperState,
     nip: Option<LauncherNipRuntime>,
     remote_actions: Vec<RemoteAction>,
     view: View,
@@ -329,6 +469,7 @@ struct AppState {
 }
 
 static PENDING_APPS: Mutex<Option<Vec<AppEntry>>> = Mutex::new(None);
+static PENDING_WALLPAPERS: Mutex<Option<WallpaperScan>> = Mutex::new(None);
 static STATE_PTR: Mutex<usize> = Mutex::new(0);
 
 fn d2d_color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
@@ -436,6 +577,22 @@ fn spawn_apps_loader(hwnd: HWND) {
     });
 }
 
+fn spawn_wallpaper_scanner(hwnd: HWND, configured_dir: String) {
+    let raw = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let scan = scan_wallpaper_folder(&configured_dir);
+        *PENDING_WALLPAPERS.lock().unwrap() = Some(scan);
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(raw as *mut c_void)),
+                WM_APP_WALLPAPERS_LOADED,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    });
+}
+
 fn read_clipboard_text(hwnd: HWND) -> Option<String> {
     unsafe {
         if OpenClipboard(Some(hwnd)).is_err() {
@@ -518,6 +675,12 @@ impl AppState {
 
     fn current_geometry(&self) -> PanelGeometry {
         let work = unsafe { work_area() };
+        let wp_count = self
+            .wp
+            .scan
+            .as_ref()
+            .map(|s| s.items.len())
+            .unwrap_or(0);
         compute_panel_geometry(
             work,
             self.dpi_scale(),
@@ -527,6 +690,7 @@ impl AppState {
             &self.query,
             self.results.len(),
             self.view,
+            wp_count,
         )
     }
 
@@ -562,7 +726,11 @@ impl AppState {
             self.remote_actions = nip.remote_actions();
         }
         self.refresh_results();
-        self.update_window_bounds();
+        if initial_view == View::Wallpaper {
+            self.start_wallpaper_session(false);
+        } else {
+            self.update_window_bounds();
+        }
         self.visible = true;
         self.opened_at = Instant::now();
         unsafe {
@@ -576,9 +744,14 @@ impl AppState {
         self.visible = false;
         self.view = View::Search;
         self.confirm.clear();
+        self.wp.anim_active = false;
+        self.wp.hovered_v = None;
         unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_CAROUSEL_ANIM);
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
+        self.d2d.thumb_bitmaps.clear();
+        self.thumbs.clear_memory();
     }
 
     fn toggle_launcher(&mut self) {
@@ -589,16 +762,172 @@ impl AppState {
         }
     }
 
-    fn open_wallpaper_view(&mut self) {
+    fn open_wallpaper_view(&mut self, from_search: bool) {
         if self.cfg.wallpaper_mode == "external" {
             let cmd = self.cfg.wallpaper_command.clone();
             self.hide_launcher();
             let _ = run_external_wallpaper_command(&cmd);
         } else {
-            self.view = View::WallpaperPlaceholder;
-            self.update_window_bounds();
-            self.invalidate();
+            self.start_wallpaper_session(from_search);
+            if !self.visible {
+                self.visible = true;
+                self.opened_at = Instant::now();
+                unsafe {
+                    let _ = ShowWindow(self.hwnd, SW_SHOW);
+                    let _ = SetForegroundWindow(self.hwnd);
+                }
+            }
         }
+    }
+
+    fn start_wallpaper_session(&mut self, from_search: bool) {
+        self.view = View::Wallpaper;
+        self.wp.from_search = from_search;
+        self.wp.loading = true;
+        self.wp.scan = None;
+        self.wp.hovered_v = None;
+        self.wp.anim_active = false;
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_CAROUSEL_ANIM);
+        }
+        self.update_window_bounds();
+        self.invalidate();
+        spawn_wallpaper_scanner(self.hwnd, self.cfg.wallpaper_dir.clone());
+    }
+
+    fn preload_carousel_thumbs(&self) {
+        let Some(ref scan) = self.wp.scan else {
+            return;
+        };
+        let count = scan.items.len();
+        if count == 0 {
+            return;
+        }
+        let radius = carousel_radius_for(count) as i64;
+        let reach = radius + 3;
+        // Request outer slots first and center-most slots last (LIFO stack pops center first).
+        for dist in (1..=reach).rev() {
+            for sign in [-1i64, 1i64] {
+                let idx = (self.wp.virtual_idx + sign * dist).rem_euclid(count as i64) as usize;
+                self.thumbs.request_only(&scan.items[idx]);
+            }
+        }
+        let center_idx = self.wp.virtual_idx.rem_euclid(count as i64) as usize;
+        self.thumbs.request_only(&scan.items[center_idx]);
+    }
+
+    fn step_carousel(&mut self, delta: i64) {
+        let count = self.wp.scan.as_ref().map(|s| s.items.len()).unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        let target = self.wp.virtual_idx + delta;
+        self.jump_carousel(target);
+    }
+
+    fn jump_carousel(&mut self, target_virtual: i64) {
+        let count = self.wp.scan.as_ref().map(|s| s.items.len()).unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        self.wp.virtual_idx = target_virtual;
+        self.wp.anim_start_val = self.wp.anim_current;
+        self.wp.anim_target_val = target_virtual as f32;
+        self.wp.anim_started_at = Instant::now();
+        self.wp.anim_active = true;
+        self.preload_carousel_thumbs();
+        unsafe {
+            let _ = SetTimer(Some(self.hwnd), TIMER_CAROUSEL_ANIM, 16, None);
+        }
+        self.invalidate();
+    }
+
+    fn apply_active_wallpaper(&mut self) {
+        let Some(ref scan) = self.wp.scan else {
+            return;
+        };
+        let count = scan.items.len();
+        if count == 0 {
+            return;
+        }
+        let idx = self.wp.virtual_idx.rem_euclid(count as i64) as usize;
+        let path = scan.items[idx].path.clone();
+        self.hide_launcher();
+        let _ = apply_wallpaper(&path);
+    }
+
+    fn carousel_visible_slots(&self, panel_w: f32, scale: f32) -> Vec<(i64, usize, D2D_RECT_F, f32)> {
+        let Some(ref scan) = self.wp.scan else {
+            return Vec::new();
+        };
+        let count = scan.items.len();
+        if count == 0 {
+            return Vec::new();
+        }
+        let radius = carousel_radius_for(count) as i64;
+        let min_v = if count == 1 {
+            0
+        } else {
+            self.wp.anim_current.floor() as i64 - radius - 1
+        };
+        let max_v = if count == 1 {
+            0
+        } else {
+            self.wp.anim_current.ceil() as i64 + radius + 1
+        };
+
+        let top = 18.0 * scale;
+        let slot_h = CAROUSEL_SLOT_H * scale;
+        let clip_left = 14.0 * scale;
+        let clip_right = panel_w - 14.0 * scale;
+
+        let mut slots = Vec::new();
+        for v in min_v..=max_v {
+            let d = v as f32 - self.wp.anim_current;
+            if count > 1 && d.abs() > (radius as f32 + 0.99) {
+                continue;
+            }
+            let (cx, sw, active_t) = carousel_slot_layout(d);
+            let sw_px = sw * scale;
+            let left = panel_w * 0.5 + cx * scale - sw_px * 0.5;
+            let right = left + sw_px;
+            if right < clip_left || left > clip_right {
+                continue;
+            }
+            let actual = v.rem_euclid(count as i64) as usize;
+            let rect = D2D_RECT_F {
+                left,
+                top,
+                right,
+                bottom: top + slot_h,
+            };
+            slots.push((v, actual, rect, active_t));
+        }
+
+        // Back-to-front so the center card renders on top of side strips.
+        slots.sort_by(|a, b| {
+            let da = (a.0 as f32 - self.wp.anim_current).abs();
+            let db = (b.0 as f32 - self.wp.anim_current).abs();
+            db.total_cmp(&da)
+        });
+        slots
+    }
+
+    fn hit_test_carousel(&self, x: f32, y: f32) -> Option<i64> {
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(self.hwnd, &mut rc);
+        }
+        let w = (rc.right - rc.left).max(1) as f32;
+        let scale = self.dpi_scale();
+        let slots = self.carousel_visible_slots(w, scale);
+        // Check front-most (center) first.
+        for (v, _, rect, _) in slots.into_iter().rev() {
+            if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                return Some(v);
+            }
+        }
+        None
     }
 
     fn execute_selected(&mut self) {
@@ -633,7 +962,7 @@ impl AppState {
                 let _ = noren_sdk::control_center::open_control_center(Some("launcher"));
             }
             ItemEffect::OpenWallpaper => {
-                self.open_wallpaper_view();
+                self.open_wallpaper_view(true);
             }
             ItemEffect::ReloadApps => {
                 self.hide_launcher();
@@ -810,13 +1139,7 @@ impl AppState {
                             }
                             "wallpaper" => {
                                 let _ = reply.ok(json!({ "ok": true }));
-                                if self.cfg.wallpaper_mode == "external" {
-                                    let _ = run_external_wallpaper_command(
-                                        &self.cfg.wallpaper_command,
-                                    );
-                                } else {
-                                    self.open_launcher(View::WallpaperPlaceholder);
-                                }
+                                self.open_wallpaper_view(false);
                             }
                             "reload_apps" => {
                                 let _ = reply.ok(json!({ "reloading": true }));
@@ -966,6 +1289,8 @@ impl AppState {
             Some(fmt_input),
             Some(fmt_title),
             Some(fmt_sub),
+            Some(fmt_title_center),
+            Some(fmt_sub_center),
             Some(fmt_glyph),
             Some(fmt_letter),
         ) = (
@@ -980,27 +1305,241 @@ impl AppState {
             self.d2d.fmt_input.clone(),
             self.d2d.fmt_title.clone(),
             self.d2d.fmt_sub.clone(),
+            self.d2d.fmt_title_center.clone(),
+            self.d2d.fmt_sub_center.clone(),
             self.d2d.fmt_glyph.clone(),
             self.d2d.fmt_letter.clone(),
         ) {
-            if self.view == View::WallpaperPlaceholder {
-                let msg = "Wallpaper Carousel (>wallpaper) will be added in Milestone 3\nPress Esc to return to search";
-                let msg_w: Vec<u16> = msg.encode_utf16().collect();
-                let rect = D2D_RECT_F {
-                    left: 24.0 * scale,
-                    top: 16.0 * scale,
-                    right: w - 24.0 * scale,
-                    bottom: h - 16.0 * scale,
-                };
-                unsafe {
-                    rt.DrawText(
-                        &msg_w,
-                        &fmt_title,
-                        &rect,
-                        &b_text,
-                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                        DWRITE_MEASURING_MODE_NATURAL,
+            if self.view == View::Wallpaper {
+                if self.wp.loading {
+                    let msg_w: Vec<u16> = "Loading wallpapers…".encode_utf16().collect();
+                    let rect = D2D_RECT_F {
+                        left: 24.0 * scale,
+                        top: 20.0 * scale,
+                        right: w - 24.0 * scale,
+                        bottom: h - 20.0 * scale,
+                    };
+                    unsafe {
+                        rt.DrawText(
+                            &msg_w,
+                            &fmt_title_center,
+                            &rect,
+                            &b_muted,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    }
+                } else if self
+                    .wp
+                    .scan
+                    .as_ref()
+                    .is_none_or(|s| s.error.is_some() || s.items.is_empty())
+                {
+                    let (headline, dir_str) = match self.wp.scan.as_ref() {
+                        Some(scan) => (
+                            scan.error
+                                .clone()
+                                .unwrap_or_else(|| "No wallpaper images found".to_string()),
+                            scan.dir.to_string_lossy().into_owned(),
+                        ),
+                        None => ("Failed to read wallpaper folder".to_string(), String::new()),
+                    };
+                    let h_w: Vec<u16> = headline.encode_utf16().collect();
+                    let d_w: Vec<u16> = dir_str.encode_utf16().collect();
+                    let hint_w: Vec<u16> = "Set Wallpaper Folder in >settings → Launcher · Esc to go back"
+                        .encode_utf16()
+                        .collect();
+                    let r1 = D2D_RECT_F {
+                        left: 24.0 * scale,
+                        top: 72.0 * scale,
+                        right: w - 24.0 * scale,
+                        bottom: 102.0 * scale,
+                    };
+                    let r2 = D2D_RECT_F {
+                        left: 24.0 * scale,
+                        top: 106.0 * scale,
+                        right: w - 24.0 * scale,
+                        bottom: 130.0 * scale,
+                    };
+                    let r3 = D2D_RECT_F {
+                        left: 24.0 * scale,
+                        top: 136.0 * scale,
+                        right: w - 24.0 * scale,
+                        bottom: 162.0 * scale,
+                    };
+                    unsafe {
+                        rt.DrawText(
+                            &h_w,
+                            &fmt_title_center,
+                            &r1,
+                            &b_text,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                        if !d_w.is_empty() {
+                            rt.DrawText(
+                                &d_w,
+                                &fmt_sub_center,
+                                &r2,
+                                &b_muted,
+                                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                                DWRITE_MEASURING_MODE_NATURAL,
+                            );
+                        }
+                        rt.DrawText(
+                            &hint_w,
+                            &fmt_sub_center,
+                            &r3,
+                            &b_muted,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    }
+                } else {
+                    let slots = self.carousel_visible_slots(w, scale);
+                    let scan = self.wp.scan.as_ref().unwrap();
+                    let count = scan.items.len();
+
+                    for (v, actual_idx, slot_rect, active_t) in slots {
+                        let entry = &scan.items[actual_idx];
+                        let corner = 10.0 * scale;
+                        let slot_rr = D2D1_ROUNDED_RECT {
+                            rect: slot_rect,
+                            radiusX: corner,
+                            radiusY: corner,
+                        };
+
+                        let mut drew_thumb = false;
+                        if let Some(px) = self.thumbs.get_or_request(entry) {
+                            if let Some(bmp) = self.d2d.bitmap_for_thumb(&rt, entry.cache_key, &px) {
+                                let sw = (slot_rect.right - slot_rect.left).max(1.0);
+                                let sh = (slot_rect.bottom - slot_rect.top).max(1.0);
+                                let s = (sw / THUMB_W as f32).max(sh / THUMB_H as f32);
+                                let tx = slot_rect.left + (sw - THUMB_W as f32 * s) * 0.5;
+                                let ty = slot_rect.top + (sh - THUMB_H as f32 * s) * 0.5;
+                                let bmp_props = D2D1_BITMAP_BRUSH_PROPERTIES {
+                                    extendModeX: D2D1_EXTEND_MODE_CLAMP,
+                                    extendModeY: D2D1_EXTEND_MODE_CLAMP,
+                                    interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                                };
+                                let brush_props = D2D1_BRUSH_PROPERTIES {
+                                    opacity: 1.0,
+                                    transform: Matrix3x2 {
+                                        M11: s,
+                                        M12: 0.0,
+                                        M21: 0.0,
+                                        M22: s,
+                                        M31: tx,
+                                        M32: ty,
+                                    },
+                                };
+                                if let Ok(bmp_brush) = unsafe {
+                                    rt.CreateBitmapBrush(&bmp, Some(&bmp_props), Some(&brush_props))
+                                } {
+                                    let b: ID2D1BitmapBrush = bmp_brush;
+                                    unsafe {
+                                        rt.FillRoundedRectangle(&slot_rr, &b);
+                                    }
+                                    drew_thumb = true;
+                                }
+                            }
+                        }
+
+                        if !drew_thumb {
+                            let gw: Vec<u16> = "\u{E8B9}".encode_utf16().collect();
+                            unsafe {
+                                rt.FillRoundedRectangle(&slot_rr, &b_tile);
+                                rt.DrawText(
+                                    &gw,
+                                    &fmt_glyph,
+                                    &slot_rect,
+                                    &b_muted,
+                                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                                    DWRITE_MEASURING_MODE_NATURAL,
+                                );
+                            }
+                        }
+
+                        let base_dim = if self.wp.hovered_v == Some(v) {
+                            0.18
+                        } else {
+                            0.42
+                        };
+                        let dim_alpha = base_dim * (1.0 - active_t);
+                        if dim_alpha > 0.01 {
+                            let dim_col = d2d_color(0.0, 0.0, 0.0, dim_alpha);
+                            if let Ok(b_dim) = unsafe { rt.CreateSolidColorBrush(&dim_col, None) } {
+                                unsafe {
+                                    rt.FillRoundedRectangle(&slot_rr, &b_dim);
+                                }
+                            }
+                        }
+
+                        if active_t > 0.05 {
+                            let stroke = 2.0 * scale;
+                            let half = stroke * 0.5;
+                            let border_rr = D2D1_ROUNDED_RECT {
+                                rect: D2D_RECT_F {
+                                    left: slot_rect.left + half,
+                                    top: slot_rect.top + half,
+                                    right: slot_rect.right - half,
+                                    bottom: slot_rect.bottom - half,
+                                },
+                                radiusX: (corner - half).max(1.0),
+                                radiusY: (corner - half).max(1.0),
+                            };
+                            let acc = rgb_to_d2d(self.theme.accent_rgb, active_t);
+                            if let Ok(b_acc) = unsafe { rt.CreateSolidColorBrush(&acc, None) } {
+                                unsafe {
+                                    rt.DrawRoundedRectangle(&border_rr, &b_acc, stroke, None);
+                                }
+                            }
+                        }
+                    }
+
+                    let active_idx = self.wp.virtual_idx.rem_euclid(count as i64) as usize;
+                    let title = if scan.initial_active == Some(active_idx) {
+                        format!("{} · current wallpaper", scan.items[active_idx].name)
+                    } else {
+                        scan.items[active_idx].name.clone()
+                    };
+                    let hint = format!(
+                        "{} / {}  ·  ←/→ browse  ·  Enter apply  ·  Esc back",
+                        active_idx + 1,
+                        count
                     );
+                    let title_w: Vec<u16> = title.encode_utf16().collect();
+                    let hint_w: Vec<u16> = hint.encode_utf16().collect();
+                    let title_rect = D2D_RECT_F {
+                        left: 20.0 * scale,
+                        top: 203.0 * scale,
+                        right: w - 20.0 * scale,
+                        bottom: 223.0 * scale,
+                    };
+                    let hint_rect = D2D_RECT_F {
+                        left: 20.0 * scale,
+                        top: 223.0 * scale,
+                        right: w - 20.0 * scale,
+                        bottom: 242.0 * scale,
+                    };
+                    unsafe {
+                        rt.DrawText(
+                            &title_w,
+                            &fmt_title_center,
+                            &title_rect,
+                            &b_text,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                        rt.DrawText(
+                            &hint_w,
+                            &fmt_sub_center,
+                            &hint_rect,
+                            &b_muted,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    }
                 }
             } else {
                 let bar_h = SEARCH_BAR_H * scale;
@@ -1406,10 +1945,55 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
-        WM_APP_ICON_READY => {
+        WM_APP_ICON_READY | WM_APP_THUMB_READY => {
             if let Some(st) = state_mut() {
                 if st.visible {
                     st.invalidate();
+                }
+            }
+            LRESULT(0)
+        }
+        WM_APP_WALLPAPERS_LOADED => {
+            if let Some(scan) = PENDING_WALLPAPERS.lock().unwrap().take() {
+                if let Some(st) = state_mut() {
+                    st.wp.loading = false;
+                    let start = scan.initial_active.unwrap_or(0) as i64;
+                    let has_items = !scan.items.is_empty();
+                    st.wp.scan = Some(scan);
+                    if has_items {
+                        st.wp.virtual_idx = start;
+                        st.wp.anim_current = start as f32;
+                        st.wp.anim_start_val = start as f32;
+                        st.wp.anim_target_val = start as f32;
+                        st.wp.anim_active = false;
+                        st.preload_carousel_thumbs();
+                    }
+                    if st.visible && st.view == View::Wallpaper {
+                        st.update_window_bounds();
+                        st.invalidate();
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            if wparam.0 == TIMER_CAROUSEL_ANIM {
+                if let Some(st) = state_mut() {
+                    if st.wp.anim_active {
+                        let elapsed = st.wp.anim_started_at.elapsed().as_secs_f32() * 1000.0;
+                        let t = (elapsed / CAROUSEL_ANIM_MS).clamp(0.0, 1.0);
+                        let ease = 1.0 - (1.0 - t).powi(3);
+                        st.wp.anim_current = st.wp.anim_start_val
+                            + (st.wp.anim_target_val - st.wp.anim_start_val) * ease;
+                        if t >= 1.0 {
+                            st.wp.anim_current = st.wp.anim_target_val;
+                            st.wp.anim_active = false;
+                            let _ = KillTimer(Some(hwnd), TIMER_CAROUSEL_ANIM);
+                        }
+                        st.invalidate();
+                    } else {
+                        let _ = KillTimer(Some(hwnd), TIMER_CAROUSEL_ANIM);
+                    }
                 }
             }
             LRESULT(0)
@@ -1425,11 +2009,7 @@ unsafe extern "system" fn wnd_proc(
                 match wparam.0 {
                     TRAY_ACT_TOGGLE => st.open_launcher(View::Search),
                     TRAY_ACT_WALLPAPER => {
-                        if st.cfg.wallpaper_mode == "external" {
-                            let _ = run_external_wallpaper_command(&st.cfg.wallpaper_command);
-                        } else {
-                            st.open_launcher(View::WallpaperPlaceholder);
-                        }
+                        st.open_wallpaper_view(false);
                     }
                     TRAY_ACT_RELOAD_APPS => spawn_apps_loader(st.hwnd),
                     TRAY_ACT_AUTOSTART => {
@@ -1483,16 +2063,40 @@ unsafe extern "system" fn wnd_proc(
                 let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
                 let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
                 let _ = shift;
-                match vk {
-                    x if x == VK_ESCAPE.0 => {
-                        if st.view == View::WallpaperPlaceholder {
-                            st.view = View::Search;
-                            st.update_window_bounds();
-                            st.invalidate();
-                        } else {
-                            st.hide_launcher();
+
+                if st.view == View::Wallpaper {
+                    let count = st.wp.scan.as_ref().map(|s| s.items.len()).unwrap_or(0);
+                    let radius = carousel_radius_for(count).max(1) as i64;
+                    match vk {
+                        x if x == VK_ESCAPE.0 => {
+                            st.wp.anim_active = false;
+                            let _ = KillTimer(Some(hwnd), TIMER_CAROUSEL_ANIM);
+                            if st.wp.from_search {
+                                st.view = View::Search;
+                                st.update_window_bounds();
+                                st.invalidate();
+                            } else {
+                                st.hide_launcher();
+                            }
                         }
+                        x if x == VK_LEFT.0 => st.step_carousel(-1),
+                        x if x == VK_RIGHT.0 => st.step_carousel(1),
+                        x if x == VK_PRIOR.0 => st.step_carousel(-radius),
+                        x if x == VK_NEXT.0 => st.step_carousel(radius),
+                        x if x == VK_HOME.0 => st.jump_carousel(0),
+                        x if x == VK_END.0 => {
+                            if count > 0 {
+                                st.jump_carousel((count - 1) as i64);
+                            }
+                        }
+                        x if x == VK_RETURN.0 => st.apply_active_wallpaper(),
+                        _ => {}
                     }
+                    return LRESULT(0);
+                }
+
+                match vk {
+                    x if x == VK_ESCAPE.0 => st.hide_launcher(),
                     x if x == VK_RETURN.0 => {
                         if st.view == View::Search {
                             st.execute_selected();
@@ -1577,8 +2181,15 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_MOUSEMOVE => {
             if let Some(st) = state_mut() {
-                if st.view == View::Search && !st.results.is_empty() {
-                    let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+                let x = (lparam.0 & 0xFFFF) as i16 as f32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+                if st.view == View::Wallpaper {
+                    let hit = st.hit_test_carousel(x, y);
+                    if hit != st.wp.hovered_v {
+                        st.wp.hovered_v = hit;
+                        st.invalidate();
+                    }
+                } else if st.view == View::Search && !st.results.is_empty() {
                     let scale = st.dpi_scale();
                     let list_top = SEARCH_BAR_H * scale + 1.0 + LIST_PAD_Y * scale;
                     if y >= list_top {
@@ -1596,13 +2207,17 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_LBUTTONDOWN => {
             if let Some(st) = state_mut() {
-                if st.view == View::Search && !st.results.is_empty() {
-                    let mut pt = POINT {
-                        x: (lparam.0 & 0xFFFF) as i16 as i32,
-                        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
-                    };
-                    let _ = ScreenToClient(hwnd, &mut pt);
-                    let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+                let x = (lparam.0 & 0xFFFF) as i16 as f32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+                if st.view == View::Wallpaper {
+                    if let Some(v) = st.hit_test_carousel(x, y) {
+                        if v == st.wp.virtual_idx {
+                            st.apply_active_wallpaper();
+                        } else {
+                            st.jump_carousel(v);
+                        }
+                    }
+                } else if st.view == View::Search && !st.results.is_empty() {
                     let scale = st.dpi_scale();
                     let list_top = SEARCH_BAR_H * scale + 1.0 + LIST_PAD_Y * scale;
                     if y >= list_top {
@@ -1620,7 +2235,16 @@ unsafe extern "system" fn wnd_proc(
         WM_MOUSEWHEEL => {
             if let Some(st) = state_mut() {
                 let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
-                if delta > 0 {
+                if st.view == View::Wallpaper {
+                    if st.wp.last_wheel_at.elapsed().as_millis() >= WHEEL_COOLDOWN_MS {
+                        st.wp.last_wheel_at = Instant::now();
+                        if delta > 0 {
+                            st.step_carousel(-1);
+                        } else if delta < 0 {
+                            st.step_carousel(1);
+                        }
+                    }
+                } else if delta > 0 {
                     st.move_selection(-1);
                 } else if delta < 0 {
                     st.move_selection(1);
@@ -1677,6 +2301,9 @@ pub fn run() -> Result<(), String> {
     };
 
     let manifest = build_launcher_manifest();
+    if let Err(e) = noren_sdk::storage::install_manifest(&manifest) {
+        eprintln!("noren-launcher: failed to install manifest: {e}");
+    }
     let cfg = LauncherConfig::load_or_default(&manifest);
     let theme = load_theme().resolve();
     unsafe {
@@ -1685,6 +2312,8 @@ pub fn run() -> Result<(), String> {
 
     let icons = IconCache::new(WM_APP_ICON_READY);
     icons.set_notify_hwnd(hwnd);
+    let thumbs = ThumbCache::new(WM_APP_THUMB_READY);
+    thumbs.set_notify_hwnd(hwnd);
 
     let nip = LauncherNipRuntime::start(hwnd.0 as isize).ok();
     let remote_actions = nip
@@ -1701,6 +2330,8 @@ pub fn run() -> Result<(), String> {
         apps_loaded: false,
         frecency: FrecencyStore::load(),
         icons,
+        thumbs,
+        wp: WallpaperState::default(),
         nip,
         remote_actions,
         view: View::Search,
@@ -1757,7 +2388,7 @@ mod tests {
             right: 1920,
             bottom: 1040,
         };
-        let geom = compute_panel_geometry(work, 1.0, 640.0, 8, false, "", 12, View::Search);
+        let geom = compute_panel_geometry(work, 1.0, 640.0, 8, false, "", 12, View::Search, 0);
         assert_eq!(geom.x, 640);
         assert_eq!(geom.y, 260);
         assert_eq!(geom.w, 640);
@@ -1765,21 +2396,39 @@ mod tests {
         assert_eq!(geom.visible_rows, 8);
         assert_eq!(geom.h, 56 + 1 + 16 + 8 * 50);
 
-        let compact = compute_panel_geometry(work, 1.0, 640.0, 8, true, "", 12, View::Search);
+        let compact = compute_panel_geometry(work, 1.0, 640.0, 8, true, "", 12, View::Search, 0);
         assert!(!compact.show_list);
         assert_eq!(compact.h, 56);
 
-        let stub = compute_panel_geometry(
-            work,
-            1.5,
-            640.0,
-            8,
-            false,
-            ">wallpaper",
-            1,
-            View::WallpaperPlaceholder,
-        );
-        assert!(!stub.show_list);
-        assert_eq!(stub.h, 270);
+        let wp_geom =
+            compute_panel_geometry(work, 1.0, 640.0, 8, false, ">wallpaper", 1, View::Wallpaper, 12);
+        assert!(!wp_geom.show_list);
+        assert_eq!(wp_geom.w, 1024);
+        assert_eq!(wp_geom.h, 248);
+        assert_eq!(wp_geom.y, 260);
+    }
+
+    #[test]
+    fn carousel_layout_morphs_smoothly_and_adapts_width() {
+        assert_eq!(carousel_radius_for(1), 0);
+        assert_eq!(carousel_radius_for(3), 1);
+        assert_eq!(carousel_radius_for(20), 5);
+        assert_eq!(carousel_panel_width(1), 384.0);
+        assert_eq!(carousel_panel_width(11), 1024.0);
+
+        let (cx0, w0, t0) = carousel_slot_layout(0.0);
+        assert_eq!(cx0, 0.0);
+        assert_eq!(w0, CAROUSEL_CENTER_W);
+        assert_eq!(t0, 1.0);
+
+        let (cx1, w1, t1) = carousel_slot_layout(1.0);
+        assert_eq!(cx1, 196.0);
+        assert_eq!(w1, CAROUSEL_STRIP_W);
+        assert_eq!(t1, 0.0);
+
+        let (cxm, wm, tm) = carousel_slot_layout(0.5);
+        assert_eq!(cxm, 98.0);
+        assert_eq!(wm, 188.0);
+        assert_eq!(tm, 0.5);
     }
 }

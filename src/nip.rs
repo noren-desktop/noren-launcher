@@ -80,7 +80,9 @@ pub struct LauncherNipRuntime {
 impl LauncherNipRuntime {
     pub fn start(hwnd_raw: isize) -> Result<Self, SdkError> {
         let manifest = build_launcher_manifest();
-        let _ = install_manifest(&manifest);
+        if let Err(e) = install_manifest(&manifest) {
+            eprintln!("noren-launcher: failed to install manifest: {e}");
+        }
 
         let tray_payload = build_launcher_tray_payload();
         let mut initial_state = HashMap::new();

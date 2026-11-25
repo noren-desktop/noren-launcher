@@ -7,6 +7,7 @@ mod icons;
 mod nip;
 mod search;
 mod ui;
+mod wallpaper;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, WPARAM};
