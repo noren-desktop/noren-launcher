@@ -95,6 +95,32 @@ pub fn open_url_in_browser(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn open_file_or_folder(path: &str) -> Result<(), String> {
+    let wide = to_wide_null(path);
+    let res = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(wide.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if (res.0 as isize) <= 32 {
+        return Err(format!("ShellExecuteW failed opening {path}"));
+    }
+    Ok(())
+}
+
+pub fn reveal_in_explorer(path: &str) -> Result<(), String> {
+    Command::new("explorer.exe")
+        .raw_arg(format!("/select,\"{path}\""))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed launching explorer.exe: {e}"))
+}
+
 pub fn autostart_enabled() -> bool {
     unsafe {
         RegGetValueW(

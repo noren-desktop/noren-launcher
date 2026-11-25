@@ -3,6 +3,7 @@
 mod actions;
 mod apps;
 mod config;
+mod files;
 mod icons;
 mod nip;
 mod search;

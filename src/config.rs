@@ -281,6 +281,45 @@ pub fn build_launcher_manifest() -> ModuleManifest {
                 ],
             },
             FieldGroup {
+                id: "file_search".to_string(),
+                title: "File Search (!f)".to_string(),
+                fields: vec![
+                    field_choice(
+                        "file_search_backend",
+                        "File Search Backend (!f)",
+                        &["windows", "everything"],
+                        "windows",
+                        Some("Windows Search Index (default) or Voidtools Everything (uses existing system install, or installs via Noren)."),
+                    ),
+                    field_text(
+                        "file_search_drives",
+                        "Partitions / Folders Scope",
+                        "",
+                        Some("All fixed partitions (or e.g. C:, D:, E:)"),
+                        Some("Leave empty to search all fixed partitions (C:, D:, E:, …), or enter comma-separated drives/folders."),
+                    ),
+                    field_action(
+                        "rescan_files_action",
+                        "Rescan File Index",
+                        "rescan_files",
+                        Some("Rebuilds the multi-partition file index in the background."),
+                    ),
+                    field_text(
+                        "everything_path",
+                        "Custom Everything.exe Path",
+                        "",
+                        Some("Auto-detect (leave empty)"),
+                        Some("Optional explicit path to Everything.exe; leave empty for automatic detection."),
+                    ),
+                    field_action(
+                        "setup_everything_action",
+                        "Detect / Install Everything via Noren",
+                        "setup_everything",
+                        Some("Starts existing Everything if found, or downloads & installs Everything via Noren if missing."),
+                    ),
+                ],
+            },
+            FieldGroup {
                 id: "wallpaper".to_string(),
                 title: "Wallpaper (>wallpaper)".to_string(),
                 fields: vec![
@@ -335,6 +374,9 @@ pub struct LauncherConfig {
     pub web_engine: String,
     pub web_custom_url: String,
     pub bang_shortcuts: String,
+    pub file_search_backend: String,
+    pub file_search_drives: String,
+    pub everything_path: String,
     pub wallpaper_mode: String,
     pub wallpaper_dir: String,
     pub wallpaper_command: String,
@@ -377,6 +419,9 @@ impl LauncherConfig {
             web_engine: get_text("web_engine", "google"),
             web_custom_url: get_text("web_custom_url", "https://www.google.com/search?q={query}"),
             bang_shortcuts: get_text("bang_shortcuts", &default_bang_shortcuts_text()),
+            file_search_backend: get_text("file_search_backend", "windows"),
+            file_search_drives: get_text("file_search_drives", ""),
+            everything_path: get_text("everything_path", ""),
             wallpaper_mode: get_text("wallpaper_mode", "builtin"),
             wallpaper_dir: get_text("wallpaper_dir", ""),
             wallpaper_command: get_text("wallpaper_command", ""),
@@ -552,6 +597,14 @@ mod tests {
             "bang_shortcuts".to_string(),
             FieldValue::Text("r | Reddit | https://www.reddit.com/search/?q={query}".to_string()),
         );
+        updates.insert(
+            "file_search_backend".to_string(),
+            FieldValue::Text("everything".to_string()),
+        );
+        updates.insert(
+            "file_search_drives".to_string(),
+            FieldValue::Text("C:, D:".to_string()),
+        );
 
         let applied = LauncherConfig::apply_updates_at(&cfg_path, &manifest, updates).unwrap();
         assert_eq!(applied.hotkey, "ctrl+space");
@@ -560,6 +613,8 @@ mod tests {
         assert_eq!(applied.web_engine, "duckduckgo");
         assert_eq!(applied.parsed_bangs().len(), 1);
         assert_eq!(applied.parsed_bangs()[0].trigger, "r");
+        assert_eq!(applied.file_search_backend, "everything");
+        assert_eq!(applied.file_search_drives, "C:, D:");
 
         let reloaded = LauncherConfig::load_from_path(&cfg_path, &manifest);
         assert_eq!(reloaded, applied);

@@ -473,6 +473,7 @@ pub fn run_nip_self_test() -> Result<(), String> {
         &crate::apps::FrecencyStore::default(),
         0,
         &remote,
+        None,
     );
     if results.first().map(|i| i.title.as_str()) != Some("Overview") {
         wm_stop.store(true, Ordering::Release);

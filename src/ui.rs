@@ -58,17 +58,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows_numerics::Matrix3x2;
 
 use crate::actions::{
-    open_url_in_browser, run_external_wallpaper_command, run_power_action, set_autostart,
+    open_file_or_folder, open_url_in_browser, reveal_in_explorer, run_external_wallpaper_command,
+    run_power_action, set_autostart,
 };
 use crate::apps::{load_apps, launch_app, now_unix_secs, AppEntry, FrecencyStore};
 use crate::config::{build_launcher_manifest, parse_hotkey_chord, LauncherConfig};
+use crate::files::FileSearchEngine;
 use crate::icons::{IconCache, ICON_BYTES, ICON_DIM};
 use crate::nip::{
     LauncherNipRuntime, TRAY_ACT_AUTOSTART, TRAY_ACT_RELOAD_APPS, TRAY_ACT_TOGGLE,
     TRAY_ACT_WALLPAPER, WM_APP_NIP_EVENT, WM_APP_QUIT, WM_APP_TRAY_ACTION,
 };
 use crate::search::{
-    detect_mode, query_results, ConfirmationState, ItemEffect, RemoteAction, SearchItem, SearchMode,
+    detect_mode, extract_file_search_term, query_results, ConfirmationState, ItemEffect,
+    RemoteAction, SearchItem, SearchMode,
 };
 use crate::wallpaper::{
     apply_wallpaper, scan_wallpaper_folder, ThumbCache, WallpaperScan, THUMB_BYTES, THUMB_H,
@@ -80,6 +83,7 @@ pub const WM_APP_APPS_LOADED: u32 = WM_APP + 2;
 pub const WM_APP_ICON_READY: u32 = WM_APP + 3;
 pub const WM_APP_WALLPAPERS_LOADED: u32 = WM_APP + 4;
 pub const WM_APP_THUMB_READY: u32 = WM_APP + 5;
+pub const WM_APP_FILE_RESULTS: u32 = WM_APP + 6;
 
 const HOTKEY_TOGGLE_ID: i32 = 1;
 const TIMER_CAROUSEL_ANIM: usize = 2;
@@ -452,6 +456,7 @@ struct AppState {
     frecency: FrecencyStore,
     icons: IconCache,
     thumbs: ThumbCache,
+    files: FileSearchEngine,
     wp: WallpaperState,
     nip: Option<LauncherNipRuntime>,
     remote_actions: Vec<RemoteAction>,
@@ -639,6 +644,19 @@ impl AppState {
 
     fn refresh_results(&mut self) {
         let now = now_unix_secs();
+        if let Some(term) = extract_file_search_term(&self.query) {
+            self.files.request_search(
+                term,
+                &self.cfg.file_search_backend,
+                &self.cfg.everything_path,
+                &self.cfg.file_search_drives,
+            );
+        } else if detect_mode(&self.query) == SearchMode::Bangs
+            && self.cfg.file_search_backend != "everything"
+        {
+            self.files.ensure_index(&self.cfg.file_search_drives);
+        }
+        let file_snap = self.files.snapshot();
         self.results = query_results(
             &self.query,
             &self.cfg,
@@ -646,6 +664,7 @@ impl AppState {
             &self.frecency,
             now,
             &self.remote_actions,
+            Some(&file_snap),
         );
         if self.results.is_empty() {
             self.selected = 0;
@@ -930,7 +949,7 @@ impl AppState {
         None
     }
 
-    fn execute_selected(&mut self) {
+    fn execute_selected(&mut self, ctrl_held: bool) {
         let Some(item) = self.results.get(self.selected).cloned() else {
             return;
         };
@@ -957,6 +976,21 @@ impl AppState {
                 self.hide_launcher();
                 let _ = open_url_in_browser(&url);
             }
+            ItemEffect::OpenFile { path } => {
+                self.hide_launcher();
+                if ctrl_held {
+                    let _ = reveal_in_explorer(&path);
+                } else {
+                    let _ = open_file_or_folder(&path);
+                }
+            }
+            ItemEffect::SetupEverything => {
+                self.files
+                    .trigger_setup_everything(&self.cfg.everything_path);
+                self.refresh_results();
+                self.update_window_bounds();
+                self.invalidate();
+            }
             ItemEffect::OpenSettings => {
                 self.hide_launcher();
                 let _ = noren_sdk::control_center::open_control_center(Some("launcher"));
@@ -967,6 +1001,7 @@ impl AppState {
             ItemEffect::ReloadApps => {
                 self.hide_launcher();
                 spawn_apps_loader(self.hwnd);
+                self.files.trigger_rescan(&self.cfg.file_search_drives);
             }
             ItemEffect::PowerCommand { id } => {
                 self.hide_launcher();
@@ -1097,6 +1132,22 @@ impl AppState {
                     "reload_apps" => {
                         let _ = reply.ok(json!({ "reloading": true }));
                         spawn_apps_loader(self.hwnd);
+                        self.files.trigger_rescan(&self.cfg.file_search_drives);
+                    }
+                    "rescan_files" => {
+                        self.files.trigger_rescan(&self.cfg.file_search_drives);
+                        let _ = reply.ok(json!({ "rescanning": true }));
+                    }
+                    "setup_everything" => {
+                        let status = self
+                            .files
+                            .trigger_setup_everything(&self.cfg.everything_path);
+                        self.refresh_results();
+                        if self.visible {
+                            self.update_window_bounds();
+                            self.invalidate();
+                        }
+                        let _ = reply.ok(json!({ "status": status }));
                     }
                     "config.apply" => {
                         let res = serde_json::from_value::<HashMap<String, FieldValue>>(data)
@@ -1117,6 +1168,15 @@ impl AppState {
                                 }
                                 if let Some(ref nip) = self.nip {
                                     nip.sync_tray_state();
+                                }
+                                if self.cfg.file_search_backend == "everything" {
+                                    if !crate::files::is_everything_running() {
+                                        if let Some(exe) =
+                                            crate::files::detect_everything_exe(&self.cfg.everything_path)
+                                        {
+                                            let _ = crate::files::start_everything_background(&exe);
+                                        }
+                                    }
                                 }
                                 self.refresh_results();
                                 if self.visible {
@@ -1758,7 +1818,10 @@ impl AppState {
                                 };
                                 let tile_brush = if item.dangerous { &b_dbg } else { &b_tile };
                                 let glyph_brush = if item.dangerous { &b_dfg } else { &b_text };
-                                let glyph_fmt = if item.app_id.is_some() {
+                                let is_app_letter = item.app_id.as_deref().is_some_and(|id| {
+                                    !id.starts_with("ext:") && !id.starts_with("path:")
+                                });
+                                let glyph_fmt = if is_app_letter {
                                     &fmt_letter
                                 } else {
                                     &fmt_glyph
@@ -1953,6 +2016,23 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
+        WM_APP_FILE_RESULTS => {
+            if let Some(st) = state_mut() {
+                st.refresh_results();
+                let icon_ids: Vec<String> = st
+                    .results
+                    .iter()
+                    .filter_map(|r| r.app_id.clone())
+                    .take(16)
+                    .collect();
+                st.icons.prewarm(&icon_ids);
+                if st.visible && st.view == View::Search {
+                    st.update_window_bounds();
+                    st.invalidate();
+                }
+            }
+            LRESULT(0)
+        }
         WM_APP_WALLPAPERS_LOADED => {
             if let Some(scan) = PENDING_WALLPAPERS.lock().unwrap().take() {
                 if let Some(st) = state_mut() {
@@ -2099,7 +2179,7 @@ unsafe extern "system" fn wnd_proc(
                     x if x == VK_ESCAPE.0 => st.hide_launcher(),
                     x if x == VK_RETURN.0 => {
                         if st.view == View::Search {
-                            st.execute_selected();
+                            st.execute_selected(ctrl);
                         }
                     }
                     x if x == VK_TAB.0 => {
@@ -2225,7 +2305,8 @@ unsafe extern "system" fn wnd_proc(
                         let idx = st.scroll_offset + slot;
                         if idx < st.results.len() {
                             st.selected = idx;
-                            st.execute_selected();
+                            let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+                            st.execute_selected(ctrl);
                         }
                     }
                 }
@@ -2314,6 +2395,8 @@ pub fn run() -> Result<(), String> {
     icons.set_notify_hwnd(hwnd);
     let thumbs = ThumbCache::new(WM_APP_THUMB_READY);
     thumbs.set_notify_hwnd(hwnd);
+    let files = FileSearchEngine::new(WM_APP_FILE_RESULTS);
+    files.set_notify_hwnd(hwnd);
 
     let nip = LauncherNipRuntime::start(hwnd.0 as isize).ok();
     let remote_actions = nip
@@ -2331,6 +2414,7 @@ pub fn run() -> Result<(), String> {
         frecency: FrecencyStore::load(),
         icons,
         thumbs,
+        files,
         wp: WallpaperState::default(),
         nip,
         remote_actions,

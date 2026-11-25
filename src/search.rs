@@ -1,8 +1,12 @@
+use std::path::Path;
+
 use noren_sdk::ShortcutEntry;
 use serde_json::Value;
 
 use crate::apps::{AppEntry, FrecencyStore};
 use crate::config::LauncherConfig;
+use crate::files::{EverythingState, FileSearchSnapshot};
+use crate::icons::icon_key_for_file;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteAction {
@@ -202,8 +206,14 @@ fn normalize_direct_url(term: &str) -> String {
 }
 
 fn effective_bangs(cfg: &LauncherConfig) -> Vec<ShortcutEntry> {
-    let mut bangs = cfg.parsed_bangs();
-    if !bangs.iter().any(|b| b.trigger.eq_ignore_ascii_case("b")) {
+    let mut bangs: Vec<ShortcutEntry> = cfg
+        .parsed_bangs()
+        .into_iter()
+        .filter(|b| !b.trigger.eq_ignore_ascii_case("f"))
+        .collect();
+    let insert_f_at = if bangs.iter().any(|b| b.trigger.eq_ignore_ascii_case("b")) {
+        1
+    } else {
         let (engine_name, engine_tpl) = template_for_engine(&cfg.web_engine, &cfg.web_custom_url);
         bangs.insert(
             0,
@@ -213,7 +223,21 @@ fn effective_bangs(cfg: &LauncherConfig) -> Vec<ShortcutEntry> {
                 url: engine_tpl,
             },
         );
-    }
+        1
+    };
+    let file_backend_label = if cfg.file_search_backend == "everything" {
+        "Files (Everything)"
+    } else {
+        "Files (Windows Search)"
+    };
+    bangs.insert(
+        insert_f_at.min(bangs.len()),
+        ShortcutEntry {
+            trigger: "f".to_string(),
+            label: file_backend_label.to_string(),
+            url: "noren://files/{query}".to_string(),
+        },
+    );
     bangs
 }
 
@@ -221,6 +245,8 @@ fn effective_bangs(cfg: &LauncherConfig) -> Vec<ShortcutEntry> {
 pub enum ItemEffect {
     LaunchApp { id: String },
     OpenWebUrl { url: String },
+    OpenFile { path: String },
+    SetupEverything,
     FillQuery { text: String },
     OpenSettings,
     OpenWallpaper,
@@ -401,6 +427,25 @@ fn query_actions(filter: &str, remote_actions: &[RemoteAction]) -> Vec<SearchIte
 }
 
 fn bang_to_hint_item(b: &ShortcutEntry, prefix_hint: bool) -> SearchItem {
+    let is_files = b.trigger.eq_ignore_ascii_case("f");
+    if is_files {
+        let subtitle = if prefix_hint {
+            "Press Enter or Tab to search files & folders (!f <query>)".to_string()
+        } else {
+            "!f <filename or path> · Enter opens, Ctrl+Enter reveals in Explorer".to_string()
+        };
+        return SearchItem {
+            key: "bang:hint:f".to_string(),
+            title: format!("{} (!f)", b.label),
+            subtitle: Some(subtitle),
+            glyph: '\u{E8B7}',
+            app_id: None,
+            dangerous: false,
+            effect: ItemEffect::FillQuery {
+                text: "!f ".to_string(),
+            },
+        };
+    }
     if is_search_template(&b.url) {
         let subtitle = if prefix_hint {
             format!("Press Enter or Tab to search {} (!{} <query>)", b.label, b.trigger)
@@ -431,7 +476,179 @@ fn bang_to_hint_item(b: &ShortcutEntry, prefix_hint: bool) -> SearchItem {
     }
 }
 
-fn query_bangs(query: &str, cfg: &LauncherConfig) -> Vec<SearchItem> {
+pub fn extract_file_search_term(query: &str) -> Option<&str> {
+    let after = query.trim_start().strip_prefix('!')?;
+    if !after.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let mut parts = after.splitn(2, char::is_whitespace);
+    let trigger = parts.next()?.trim();
+    if trigger.eq_ignore_ascii_case("f") {
+        Some(parts.next().unwrap_or("").trim())
+    } else {
+        None
+    }
+}
+
+fn query_file_search_items(
+    term: &str,
+    cfg: &LauncherConfig,
+    file_snap: Option<&FileSearchSnapshot>,
+) -> Vec<SearchItem> {
+    let mut items = Vec::new();
+    let using_everything = cfg.file_search_backend == "everything";
+
+    if using_everything {
+        if let Some(snap) = file_snap {
+            match &snap.everything_state {
+                EverythingState::NotInstalled => {
+                    items.push(SearchItem {
+                        key: "files:install-everything".to_string(),
+                        title: "Install Everything via Noren".to_string(),
+                        subtitle: Some(
+                            "Everything not found on PC · Press Enter to install & start (Windows Search fallback active)"
+                                .to_string(),
+                        ),
+                        glyph: '\u{E896}',
+                        app_id: None,
+                        dangerous: false,
+                        effect: ItemEffect::SetupEverything,
+                    });
+                }
+                EverythingState::InstallFailed(err) => {
+                    items.push(SearchItem {
+                        key: "files:retry-everything".to_string(),
+                        title: "Retry Everything setup via Noren".to_string(),
+                        subtitle: Some(format!(
+                            "Previous setup incomplete ({err}) · Press Enter to retry"
+                        )),
+                        glyph: '\u{E896}',
+                        app_id: None,
+                        dangerous: false,
+                        effect: ItemEffect::SetupEverything,
+                    });
+                }
+                EverythingState::Starting => {
+                    items.push(SearchItem {
+                        key: "files:starting-everything".to_string(),
+                        title: "Starting Everything in background…".to_string(),
+                        subtitle: Some("Using Windows Search until Everything IPC is ready".to_string()),
+                        glyph: '\u{E768}',
+                        app_id: None,
+                        dangerous: false,
+                        effect: ItemEffect::FillQuery {
+                            text: format!("!f {term}"),
+                        },
+                    });
+                }
+                EverythingState::Installing => {
+                    items.push(SearchItem {
+                        key: "files:installing-everything".to_string(),
+                        title: "Installing Everything via Noren…".to_string(),
+                        subtitle: Some("Downloading & starting Everything background service…".to_string()),
+                        glyph: '\u{E896}',
+                        app_id: None,
+                        dangerous: false,
+                        effect: ItemEffect::FillQuery {
+                            text: format!("!f {term}"),
+                        },
+                    });
+                }
+                EverythingState::SdkMissing(_) => {
+                    items.push(SearchItem {
+                        key: "files:sdk-everything".to_string(),
+                        title: "Preparing Everything SDK integration…".to_string(),
+                        subtitle: Some("Press Enter to finish setup or continue with fallback results".to_string()),
+                        glyph: '\u{E896}',
+                        app_id: None,
+                        dangerous: false,
+                        effect: ItemEffect::SetupEverything,
+                    });
+                }
+                EverythingState::Ready => {}
+            }
+        }
+    }
+
+    if term.is_empty() {
+        let backend_note = if using_everything {
+            "Everything"
+        } else {
+            "Windows Search"
+        };
+        items.push(SearchItem {
+            key: "files:prompt".to_string(),
+            title: "Type a filename or folder path to search…".to_string(),
+            subtitle: Some(format!(
+                "{backend_note} · Enter opens, Ctrl+Enter reveals in Explorer"
+            )),
+            glyph: '\u{E8B7}',
+            app_id: None,
+            dangerous: false,
+            effect: ItemEffect::FillQuery {
+                text: "!f ".to_string(),
+            },
+        });
+        return items;
+    }
+
+    if let Some(snap) = file_snap {
+        if snap.query == term && !snap.entries.is_empty() {
+            for entry in &snap.entries {
+                let p = Path::new(&entry.path);
+                items.push(SearchItem {
+                    key: format!("file:{}", entry.path),
+                    title: entry.name.clone(),
+                    subtitle: if entry.parent_dir.is_empty() {
+                        None
+                    } else {
+                        Some(entry.parent_dir.clone())
+                    },
+                    glyph: if entry.is_dir { '\u{E8B7}' } else { '\u{E8A5}' },
+                    app_id: Some(icon_key_for_file(p, entry.is_dir)),
+                    dangerous: false,
+                    effect: ItemEffect::OpenFile {
+                        path: entry.path.clone(),
+                    },
+                });
+            }
+            return items;
+        }
+        if snap.loading {
+            items.push(SearchItem {
+                key: format!("files:loading:{term}"),
+                title: format!("Searching files for \"{term}\"…"),
+                subtitle: Some("Enter opens when ready, Ctrl+Enter reveals in Explorer".to_string()),
+                glyph: '\u{E721}',
+                app_id: None,
+                dangerous: false,
+                effect: ItemEffect::FillQuery {
+                    text: format!("!f {term}"),
+                },
+            });
+            return items;
+        }
+    }
+
+    items.push(SearchItem {
+        key: format!("files:empty:{term}"),
+        title: format!("No files matching \"{term}\""),
+        subtitle: Some("Try another filename, AQS filter (ext:pdf), or full path (C:\\...)".to_string()),
+        glyph: '\u{E8B7}',
+        app_id: None,
+        dangerous: false,
+        effect: ItemEffect::FillQuery {
+            text: format!("!f {term}"),
+        },
+    });
+    items
+}
+
+fn query_bangs(
+    query: &str,
+    cfg: &LauncherConfig,
+    file_snap: Option<&FileSearchSnapshot>,
+) -> Vec<SearchItem> {
     let after = query.trim_start().strip_prefix('!').unwrap_or("");
     let bangs = effective_bangs(cfg);
     let (default_engine_name, default_engine_tpl) =
@@ -485,10 +702,14 @@ fn query_bangs(query: &str, cfg: &LauncherConfig) -> Vec<SearchItem> {
         }];
     }
 
-    // Contains whitespace: "!<trigger> <term>" (including "!yt ").
+    // Contains whitespace: "!<trigger> <term>" (including "!yt " and "!f ").
     let mut parts = after.splitn(2, char::is_whitespace);
     let trigger = parts.next().unwrap_or("").trim();
     let term = parts.next().unwrap_or("").trim();
+
+    if trigger.eq_ignore_ascii_case("f") {
+        return query_file_search_items(term, cfg, file_snap);
+    }
 
     if let Some(b) = bangs.iter().find(|b| b.trigger.eq_ignore_ascii_case(trigger)) {
         if !is_search_template(&b.url) {
@@ -564,13 +785,14 @@ pub fn query_results(
     frecency: &FrecencyStore,
     now_secs: u64,
     remote_actions: &[RemoteAction],
+    file_snap: Option<&FileSearchSnapshot>,
 ) -> Vec<SearchItem> {
     match detect_mode(query) {
         SearchMode::Actions => {
             let filter = query.trim_start().strip_prefix('>').unwrap_or("");
             query_actions(filter, remote_actions)
         }
-        SearchMode::Bangs => query_bangs(query, cfg),
+        SearchMode::Bangs => query_bangs(query, cfg, file_snap),
         SearchMode::Apps => {
             let q = query.trim();
             if q.is_empty() {
@@ -703,15 +925,15 @@ mod tests {
             },
         );
 
-        let empty_non_compact = query_results("", &cfg, &apps, &frec, now, &[]);
+        let empty_non_compact = query_results("", &cfg, &apps, &frec, now, &[], None);
         assert_eq!(empty_non_compact[0].title, "Notepad");
         assert_eq!(empty_non_compact[1].title, "Calculator");
         assert_eq!(empty_non_compact[2].title, "Firefox");
 
         cfg.compact_mode = true;
-        assert!(query_results("", &cfg, &apps, &frec, now, &[]).is_empty());
+        assert!(query_results("", &cfg, &apps, &frec, now, &[], None).is_empty());
 
-        let filtered = query_results("code", &cfg, &apps, &frec, now, &[]);
+        let filtered = query_results("code", &cfg, &apps, &frec, now, &[], None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].title, "Visual Studio Code");
     }
@@ -722,12 +944,18 @@ mod tests {
         let apps = sample_apps();
         let frec = FrecencyStore::default();
 
-        // Bare "!" lists !b plus built-in bangs.
-        let list_all = query_results("!", &cfg, &apps, &frec, 0, &[]);
+        // Bare "!" lists !b, !f, plus built-in bangs.
+        let list_all = query_results("!", &cfg, &apps, &frec, 0, &[], None);
         assert_eq!(
             list_all[0].effect,
             ItemEffect::FillQuery {
                 text: "!b ".to_string()
+            }
+        );
+        assert_eq!(
+            list_all[1].effect,
+            ItemEffect::FillQuery {
+                text: "!f ".to_string()
             }
         );
         assert!(list_all.iter().any(|i| i.effect
@@ -735,8 +963,16 @@ mod tests {
                 text: "!yt ".to_string()
             }));
 
+        let file_hint = query_results("!f", &cfg, &apps, &frec, 0, &[], None);
+        assert_eq!(
+            file_hint[0].effect,
+            ItemEffect::FillQuery {
+                text: "!f ".to_string()
+            }
+        );
+
         // Partial "!y" matches YouTube first.
-        let partial = query_results("!y", &cfg, &apps, &frec, 0, &[]);
+        let partial = query_results("!y", &cfg, &apps, &frec, 0, &[], None);
         assert_eq!(
             partial[0].effect,
             ItemEffect::FillQuery {
@@ -745,7 +981,7 @@ mod tests {
         );
 
         // Direct !yt, !gh, !wiki without !b.
-        let yt = query_results("!yt lofi beats", &cfg, &apps, &frec, 0, &[]);
+        let yt = query_results("!yt lofi beats", &cfg, &apps, &frec, 0, &[], None);
         assert_eq!(
             yt[0].effect,
             ItemEffect::OpenWebUrl {
@@ -753,7 +989,7 @@ mod tests {
             }
         );
 
-        let gh = query_results("!gh windows-rs", &cfg, &apps, &frec, 0, &[]);
+        let gh = query_results("!gh windows-rs", &cfg, &apps, &frec, 0, &[], None);
         assert_eq!(
             gh[0].effect,
             ItemEffect::OpenWebUrl {
@@ -761,7 +997,7 @@ mod tests {
             }
         );
 
-        let wiki = query_results("!wiki noren", &cfg, &apps, &frec, 0, &[]);
+        let wiki = query_results("!wiki noren", &cfg, &apps, &frec, 0, &[], None);
         assert_eq!(
             wiki[0].effect,
             ItemEffect::OpenWebUrl {
@@ -770,7 +1006,7 @@ mod tests {
         );
 
         // !b with configured engines + direct URL detection.
-        let google = query_results("!b rust direct2d", &cfg, &apps, &frec, 0, &[]);
+        let google = query_results("!b rust direct2d", &cfg, &apps, &frec, 0, &[], None);
         assert_eq!(
             google[0].effect,
             ItemEffect::OpenWebUrl {
@@ -778,7 +1014,7 @@ mod tests {
             }
         );
 
-        let direct = query_results("!b github.com", &cfg, &apps, &frec, 0, &[]);
+        let direct = query_results("!b github.com", &cfg, &apps, &frec, 0, &[], None);
         assert_eq!(
             direct[0].effect,
             ItemEffect::OpenWebUrl {
@@ -793,7 +1029,7 @@ mod tests {
         );
 
         cfg.web_engine = "brave".to_string();
-        let brave = query_results("!b noren", &cfg, &apps, &frec, 0, &[]);
+        let brave = query_results("!b noren", &cfg, &apps, &frec, 0, &[], None);
         assert_eq!(
             brave[0].effect,
             ItemEffect::OpenWebUrl {
@@ -809,7 +1045,7 @@ mod tests {
         ]
         .join("\n");
 
-        let custom_b = query_results("!b winui3", &cfg, &apps, &frec, 0, &[]);
+        let custom_b = query_results("!b winui3", &cfg, &apps, &frec, 0, &[], None);
         assert_eq!(
             custom_b[0].effect,
             ItemEffect::OpenWebUrl {
@@ -817,7 +1053,7 @@ mod tests {
             }
         );
 
-        let reddit = query_results("!r rust", &cfg, &apps, &frec, 0, &[]);
+        let reddit = query_results("!r rust", &cfg, &apps, &frec, 0, &[], None);
         assert_eq!(
             reddit[0].effect,
             ItemEffect::OpenWebUrl {
@@ -825,11 +1061,41 @@ mod tests {
             }
         );
 
-        let gmail = query_results("!mail", &cfg, &apps, &frec, 0, &[]);
+        let gmail = query_results("!mail", &cfg, &apps, &frec, 0, &[], None);
         assert_eq!(
             gmail[0].effect,
             ItemEffect::OpenWebUrl {
                 url: "https://mail.google.com".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn file_search_renders_results_and_everything_setup_cta() {
+        let mut cfg = LauncherConfig::default();
+        let apps = sample_apps();
+        let frec = FrecencyStore::default();
+
+        let snap = FileSearchSnapshot {
+            query: "notes".to_string(),
+            backend: "everything".to_string(),
+            loading: false,
+            everything_state: EverythingState::NotInstalled,
+            entries: vec![crate::files::FileEntry {
+                name: "notes.txt".to_string(),
+                path: "C:\\Users\\Demo\\Documents\\notes.txt".to_string(),
+                parent_dir: "C:\\Users\\Demo\\Documents".to_string(),
+                is_dir: false,
+            }],
+        };
+
+        cfg.file_search_backend = "everything".to_string();
+        let items = query_results("!f notes", &cfg, &apps, &frec, 0, &[], Some(&snap));
+        assert_eq!(items[0].effect, ItemEffect::SetupEverything);
+        assert_eq!(
+            items[1].effect,
+            ItemEffect::OpenFile {
+                path: "C:\\Users\\Demo\\Documents\\notes.txt".to_string()
             }
         );
     }
@@ -862,7 +1128,7 @@ mod tests {
         let apps = sample_apps();
         let frec = FrecencyStore::default();
 
-        let over = query_results(">over", &cfg, &apps, &frec, 0, &remote);
+        let over = query_results(">over", &cfg, &apps, &frec, 0, &remote, None);
         assert_eq!(
             over[0].effect,
             ItemEffect::RemoteNipCommand {
@@ -872,7 +1138,7 @@ mod tests {
             }
         );
 
-        let all_actions = query_results(">", &cfg, &apps, &frec, 0, &remote);
+        let all_actions = query_results(">", &cfg, &apps, &frec, 0, &remote, None);
         let restart = all_actions
             .iter()
             .find(|i| i.key == "builtin:restart")

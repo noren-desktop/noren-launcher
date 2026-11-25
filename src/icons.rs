@@ -188,8 +188,52 @@ fn resample_pbgra_to_64(src_w: u32, src_h: u32, src: &[u8]) -> [u8; ICON_BYTES] 
     out
 }
 
-unsafe fn extract_shell_icon_64(app_id: &str) -> Option<Arc<[u8; ICON_BYTES]>> {
-    let parsing = format!("shell:AppsFolder\\{app_id}");
+/// Builds a cache-friendly `IconCache` key for a file or folder path.
+/// Folders and common document extensions share an icon key across files, while
+/// executables/shortcuts keep per-file icons.
+pub fn icon_key_for_file(path: &Path, is_dir: bool) -> String {
+    let full = path.to_string_lossy();
+    if is_dir {
+        return format!("ext:__folder__|{full}");
+    }
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(
+        ext.as_str(),
+        "" | "exe" | "lnk" | "ico" | "url" | "appref-ms" | "msc" | "cpl"
+    ) {
+        format!("path:{full}")
+    } else {
+        format!("ext:.{ext}|{full}")
+    }
+}
+
+fn cache_lookup_key(icon_id: &str) -> &str {
+    if let Some(rest) = icon_id.strip_prefix("ext:") {
+        let ext_part = rest.split('|').next().unwrap_or(rest);
+        let prefix_len = "ext:".len() + ext_part.len();
+        return &icon_id[..prefix_len];
+    }
+    icon_id
+}
+
+fn parsing_name_for_icon(icon_id: &str) -> String {
+    if let Some(rest) = icon_id.strip_prefix("ext:") {
+        if let Some((_, sample_path)) = rest.split_once('|') {
+            return sample_path.to_string();
+        }
+    }
+    if let Some(full) = icon_id.strip_prefix("path:") {
+        return full.to_string();
+    }
+    format!("shell:AppsFolder\\{icon_id}")
+}
+
+unsafe fn extract_shell_icon_64(icon_id: &str) -> Option<Arc<[u8; ICON_BYTES]>> {
+    let parsing = parsing_name_for_icon(icon_id);
     let wide: Vec<u16> = parsing.encode_utf16().chain(std::iter::once(0)).collect();
     let factory: IShellItemImageFactory =
         SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
@@ -237,10 +281,11 @@ impl IconCache {
         let worker_shared = Arc::clone(&shared);
         thread::spawn(move || {
             let com_ok = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
-            while let Ok(app_id) = rx.recv() {
-                let path = cache_file_path(&dir, &app_id);
+            while let Ok(request_id) = rx.recv() {
+                let key = cache_lookup_key(&request_id).to_string();
+                let path = cache_file_path(&dir, &key);
                 let extracted = read_cached_icon(&path).or_else(|| {
-                    let img = unsafe { extract_shell_icon_64(&app_id) };
+                    let img = unsafe { extract_shell_icon_64(&request_id) };
                     if let Some(ref px) = img {
                         write_cached_icon(&path, px);
                     }
@@ -251,8 +296,8 @@ impl IconCache {
                     .cache
                     .lock()
                     .unwrap()
-                    .insert(app_id.clone(), extracted);
-                worker_shared.pending.lock().unwrap().remove(&app_id);
+                    .insert(key.clone(), extracted);
+                worker_shared.pending.lock().unwrap().remove(&key);
                 if has_image {
                     let raw = worker_shared.notify_hwnd.load(Ordering::Acquire);
                     if raw != 0 {
@@ -284,11 +329,12 @@ impl IconCache {
     }
 
     pub fn get_or_request(&self, app_id: &str) -> Option<Arc<[u8; ICON_BYTES]>> {
-        if let Some(entry) = self.shared.cache.lock().unwrap().get(app_id) {
+        let key = cache_lookup_key(app_id);
+        if let Some(entry) = self.shared.cache.lock().unwrap().get(key) {
             return entry.clone();
         }
         let mut pending = self.shared.pending.lock().unwrap();
-        if pending.insert(app_id.to_string()) {
+        if pending.insert(key.to_string()) {
             let _ = self.tx.send(app_id.to_string());
         }
         None
