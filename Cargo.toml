@@ -1,0 +1,39 @@
+[package]
+name = "noren-launcher"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "Keyboard-driven native launcher module for Noren"
+
+[[bin]]
+name = "noren-launcher"
+path = "src/main.rs"
+
+[dependencies]
+noren-sdk = { git = "https://github.com/noren-desktop/noren-sdk.git" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[dependencies.windows]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]

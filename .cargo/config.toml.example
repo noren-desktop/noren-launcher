@@ -1,0 +1,2 @@
+[patch."https://github.com/noren-desktop/noren-sdk.git"]
+noren-sdk = { path = "../noren-sdk" }
