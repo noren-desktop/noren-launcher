@@ -847,7 +847,7 @@ fn app_entry_to_item(a: &AppEntry) -> SearchItem {
     SearchItem {
         key: format!("app:{}", a.id),
         title: a.name.clone(),
-        subtitle: None,
+        subtitle: a.id.starts_with("path:").then(|| "Desktop".to_string()),
         glyph,
         app_id: Some(a.id.clone()),
         dangerous: false,

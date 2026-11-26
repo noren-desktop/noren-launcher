@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -13,7 +13,8 @@ use windows::Win32::System::Com::{
     CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Shell::{
-    BHID_EnumItems, IEnumShellItems, IShellItem, IShellItem2, SHCreateItemFromParsingName,
+    BHID_EnumItems, FOLDERID_Desktop, FOLDERID_PublicDesktop, IEnumShellItems, IShellItem,
+    IShellItem2, SHCreateItemFromParsingName, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG,
     SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
 };
 
@@ -141,16 +142,113 @@ fn load_apps_ps() -> Vec<AppEntry> {
     apps
 }
 
-pub fn load_apps() -> Vec<AppEntry> {
-    let native = load_apps_native();
-    if !native.is_empty() {
-        native
-    } else {
-        load_apps_ps()
+fn known_folder_path(id: &GUID) -> Option<PathBuf> {
+    unsafe {
+        let raw = SHGetKnownFolderPath(id, KNOWN_FOLDER_FLAG(0), None).ok()?;
+        let s = take_pwstr(raw);
+        (!s.is_empty()).then(|| PathBuf::from(s))
     }
 }
 
+pub fn load_desktop_shortcuts_from_dirs(dirs: &[PathBuf]) -> Vec<AppEntry> {
+    let mut entries = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for dir in dirs {
+        let Ok(rd) = fs::read_dir(dir) else {
+            continue;
+        };
+        for item in rd.flatten() {
+            let path = item.path();
+            let Ok(ft) = item.file_type() else {
+                continue;
+            };
+            if ft.is_dir() {
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+            if !matches!(ext.as_str(), "lnk" | "url" | "appref-ms" | "exe") {
+                continue;
+            }
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let full = path.to_string_lossy().into_owned();
+            if seen_paths.insert(full.to_lowercase()) {
+                entries.push(AppEntry {
+                    name,
+                    id: format!("path:{full}"),
+                });
+            }
+        }
+    }
+    entries
+}
+
+fn load_desktop_shortcuts() -> Vec<AppEntry> {
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_dir = |p: PathBuf| {
+        let k = p.to_string_lossy().to_lowercase();
+        if p.is_dir() && seen.insert(k) {
+            dirs.push(p);
+        }
+    };
+
+    if let Some(user_desktop) = known_folder_path(&FOLDERID_Desktop) {
+        push_dir(user_desktop);
+    } else if let Some(profile) = std::env::var_os("USERPROFILE") {
+        push_dir(PathBuf::from(profile).join("Desktop"));
+    }
+    if let Some(public_desktop) = known_folder_path(&FOLDERID_PublicDesktop) {
+        push_dir(public_desktop);
+    }
+
+    load_desktop_shortcuts_from_dirs(&dirs)
+}
+
+pub fn merge_start_and_desktop_apps(
+    mut start_apps: Vec<AppEntry>,
+    desktop_apps: Vec<AppEntry>,
+) -> Vec<AppEntry> {
+    let mut seen_names: HashSet<String> = start_apps
+        .iter()
+        .map(|a| a.name.trim().to_lowercase())
+        .collect();
+    for entry in desktop_apps {
+        let key = entry.name.trim().to_lowercase();
+        if seen_names.insert(key) {
+            start_apps.push(entry);
+        }
+    }
+    start_apps.sort_by_key(|a| a.name.to_lowercase());
+    start_apps
+}
+
+pub fn load_apps() -> Vec<AppEntry> {
+    let native = load_apps_native();
+    let start_apps = if !native.is_empty() {
+        native
+    } else {
+        load_apps_ps()
+    };
+    let desktop_apps = load_desktop_shortcuts();
+    merge_start_and_desktop_apps(start_apps, desktop_apps)
+}
+
 pub fn launch_app(id: &str) -> Result<(), String> {
+    if let Some(full_path) = id.strip_prefix("path:") {
+        return crate::actions::open_file_or_folder(full_path);
+    }
     Command::new("explorer.exe")
         .arg(format!("shell:AppsFolder\\{id}"))
         .creation_flags(CREATE_NO_WINDOW)
@@ -276,6 +374,41 @@ mod tests {
 
         let reloaded = FrecencyStore::load_from(&path);
         assert_eq!(reloaded.entries.get("app.recent").unwrap().count, 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn desktop_shortcuts_load_and_merge_without_duplicates() {
+        let dir = std::env::temp_dir().join(format!(
+            "noren_launcher_desktop_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("SubFolder")).unwrap();
+        fs::write(dir.join("Work - Chrome.lnk"), b"lnk").unwrap();
+        fs::write(dir.join("Discord.lnk"), b"lnk").unwrap();
+        fs::write(dir.join("Docs.url"), b"url").unwrap();
+        fs::write(dir.join("MyTool.exe"), b"exe").unwrap();
+        fs::write(dir.join("readme.txt"), b"txt").unwrap();
+
+        let desktop = load_desktop_shortcuts_from_dirs(&[dir.clone()]);
+        let desktop_names: Vec<&str> = desktop.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(desktop.len(), 4);
+        assert!(desktop_names.contains(&"Work - Chrome"));
+        assert!(desktop_names.contains(&"Docs"));
+        assert!(desktop_names.contains(&"MyTool"));
+        assert!(desktop.iter().all(|e| e.id.starts_with("path:")));
+
+        let start = vec![AppEntry {
+            name: "Discord".to_string(),
+            id: "com.squirrel.Discord.Discord".to_string(),
+        }];
+        let merged = merge_start_and_desktop_apps(start, desktop);
+        assert_eq!(merged.len(), 4);
+        let discord = merged.iter().find(|a| a.name == "Discord").unwrap();
+        assert_eq!(discord.id, "com.squirrel.Discord.Discord");
+        assert!(merged.iter().any(|a| a.name == "Work - Chrome"));
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1842,9 +1842,7 @@ impl AppState {
                                 };
                                 let tile_brush = if item.dangerous { &b_dbg } else { &b_tile };
                                 let glyph_brush = if item.dangerous { &b_dfg } else { &b_text };
-                                let is_app_letter = item.app_id.as_deref().is_some_and(|id| {
-                                    !id.starts_with("ext:") && !id.starts_with("path:")
-                                });
+                                let is_app_letter = item.key.starts_with("app:");
                                 let glyph_fmt = if is_app_letter {
                                     &fmt_letter
                                 } else {
