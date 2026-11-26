@@ -99,6 +99,7 @@ pub const CAROUSEL_STRIP_W: f32 = 56.0;
 pub const CAROUSEL_SLOT_H: f32 = 180.0;
 pub const CAROUSEL_GAP: f32 = 8.0;
 pub const CAROUSEL_PANEL_H: f32 = 248.0;
+pub const CAROUSEL_PANEL_H_NO_HINT: f32 = 230.0;
 const CAROUSEL_ANIM_MS: f32 = 220.0;
 const WHEEL_COOLDOWN_MS: u128 = 90;
 
@@ -163,6 +164,7 @@ pub fn compute_panel_geometry(
     result_count: usize,
     view: View,
     wallpaper_count: usize,
+    wallpaper_show_hint: bool,
 ) -> PanelGeometry {
     let work_w = (work.right - work.left).max(320);
     let work_h = (work.bottom - work.top).max(240);
@@ -174,11 +176,16 @@ pub fn compute_panel_geometry(
             .max(320.0) as i32;
         let w = w.min(work_w - 32);
         let x = work.left + (work_w - w) / 2;
+        let panel_h = if wallpaper_show_hint {
+            CAROUSEL_PANEL_H
+        } else {
+            CAROUSEL_PANEL_H_NO_HINT
+        };
         return PanelGeometry {
             x,
             y,
             w,
-            h: (CAROUSEL_PANEL_H * dpi_scale).round() as i32,
+            h: (panel_h * dpi_scale).round() as i32,
             show_list: false,
             visible_rows: 0,
         };
@@ -712,6 +719,7 @@ impl AppState {
             self.results.len(),
             self.view,
             wp_count,
+            self.cfg.wallpaper_show_hint,
         )
     }
 
@@ -1587,24 +1595,12 @@ impl AppState {
                     } else {
                         scan.items[active_idx].name.clone()
                     };
-                    let hint = format!(
-                        "{} / {}  ·  ←/→ browse  ·  Enter apply  ·  Esc back",
-                        active_idx + 1,
-                        count
-                    );
                     let title_w: Vec<u16> = title.encode_utf16().collect();
-                    let hint_w: Vec<u16> = hint.encode_utf16().collect();
                     let title_rect = D2D_RECT_F {
                         left: 20.0 * scale,
                         top: 203.0 * scale,
                         right: w - 20.0 * scale,
                         bottom: 223.0 * scale,
-                    };
-                    let hint_rect = D2D_RECT_F {
-                        left: 20.0 * scale,
-                        top: 223.0 * scale,
-                        right: w - 20.0 * scale,
-                        bottom: 242.0 * scale,
                     };
                     unsafe {
                         rt.DrawText(
@@ -1615,14 +1611,30 @@ impl AppState {
                             D2D1_DRAW_TEXT_OPTIONS_CLIP,
                             DWRITE_MEASURING_MODE_NATURAL,
                         );
-                        rt.DrawText(
-                            &hint_w,
-                            &fmt_sub_center,
-                            &hint_rect,
-                            &b_muted,
-                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                            DWRITE_MEASURING_MODE_NATURAL,
+                    }
+                    if self.cfg.wallpaper_show_hint {
+                        let hint = format!(
+                            "{} / {}  ·  ←/→ browse  ·  Enter apply  ·  Esc back",
+                            active_idx + 1,
+                            count
                         );
+                        let hint_w: Vec<u16> = hint.encode_utf16().collect();
+                        let hint_rect = D2D_RECT_F {
+                            left: 20.0 * scale,
+                            top: 223.0 * scale,
+                            right: w - 20.0 * scale,
+                            bottom: 242.0 * scale,
+                        };
+                        unsafe {
+                            rt.DrawText(
+                                &hint_w,
+                                &fmt_sub_center,
+                                &hint_rect,
+                                &b_muted,
+                                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                                DWRITE_MEASURING_MODE_NATURAL,
+                            );
+                        }
                     }
                 }
             } else {
@@ -2549,7 +2561,7 @@ mod tests {
             right: 1920,
             bottom: 1040,
         };
-        let geom = compute_panel_geometry(work, 1.0, 640.0, 8, false, "", 12, View::Search, 0);
+        let geom = compute_panel_geometry(work, 1.0, 640.0, 8, false, "", 12, View::Search, 0, true);
         assert_eq!(geom.x, 640);
         assert_eq!(geom.y, 260);
         assert_eq!(geom.w, 640);
@@ -2557,16 +2569,41 @@ mod tests {
         assert_eq!(geom.visible_rows, 8);
         assert_eq!(geom.h, 56 + 1 + 16 + 8 * 50);
 
-        let compact = compute_panel_geometry(work, 1.0, 640.0, 8, true, "", 12, View::Search, 0);
+        let compact =
+            compute_panel_geometry(work, 1.0, 640.0, 8, true, "", 12, View::Search, 0, true);
         assert!(!compact.show_list);
         assert_eq!(compact.h, 56);
 
-        let wp_geom =
-            compute_panel_geometry(work, 1.0, 640.0, 8, false, ">wallpaper", 1, View::Wallpaper, 12);
+        let wp_geom = compute_panel_geometry(
+            work,
+            1.0,
+            640.0,
+            8,
+            false,
+            ">wallpaper",
+            1,
+            View::Wallpaper,
+            12,
+            true,
+        );
         assert!(!wp_geom.show_list);
         assert_eq!(wp_geom.w, 1024);
         assert_eq!(wp_geom.h, 248);
         assert_eq!(wp_geom.y, 260);
+
+        let wp_no_hint = compute_panel_geometry(
+            work,
+            1.0,
+            640.0,
+            8,
+            false,
+            ">wallpaper",
+            1,
+            View::Wallpaper,
+            12,
+            false,
+        );
+        assert_eq!(wp_no_hint.h, 230);
     }
 
     #[test]

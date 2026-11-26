@@ -344,6 +344,12 @@ pub fn build_launcher_manifest() -> ModuleManifest {
                         Some("\"C:\\Tools\\wallswitch.exe\""),
                         Some("Command run when Wallpaper Mode is set to external."),
                     ),
+                    field_bool(
+                        "wallpaper_show_hint",
+                        "Show Wallpaper Hints",
+                        true,
+                        Some("Show keyboard navigation hint below the wallpaper carousel."),
+                    ),
                 ],
             },
             FieldGroup {
@@ -380,6 +386,7 @@ pub struct LauncherConfig {
     pub wallpaper_mode: String,
     pub wallpaper_dir: String,
     pub wallpaper_command: String,
+    pub wallpaper_show_hint: bool,
 }
 
 impl Default for LauncherConfig {
@@ -425,6 +432,7 @@ impl LauncherConfig {
             wallpaper_mode: get_text("wallpaper_mode", "builtin"),
             wallpaper_dir: get_text("wallpaper_dir", ""),
             wallpaper_command: get_text("wallpaper_command", ""),
+            wallpaper_show_hint: get_bool("wallpaper_show_hint", true),
         }
     }
 
@@ -605,6 +613,7 @@ mod tests {
             "file_search_drives".to_string(),
             FieldValue::Text("C:, D:".to_string()),
         );
+        updates.insert("wallpaper_show_hint".to_string(), FieldValue::Bool(false));
 
         let applied = LauncherConfig::apply_updates_at(&cfg_path, &manifest, updates).unwrap();
         assert_eq!(applied.hotkey, "ctrl+space");
@@ -615,6 +624,7 @@ mod tests {
         assert_eq!(applied.parsed_bangs()[0].trigger, "r");
         assert_eq!(applied.file_search_backend, "everything");
         assert_eq!(applied.file_search_drives, "C:, D:");
+        assert!(!applied.wallpaper_show_hint);
 
         let reloaded = LauncherConfig::load_from_path(&cfg_path, &manifest);
         assert_eq!(reloaded, applied);
