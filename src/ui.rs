@@ -1296,25 +1296,25 @@ impl AppState {
 
         let is_dark = self.theme.is_dark;
         let bg = if self.theme.transparency_enabled {
-            if is_dark {
-                d2d_color(0.10, 0.11, 0.13, 0.64)
-            } else {
-                d2d_color(0.96, 0.96, 0.97, 0.74)
-            }
+            // Pure transparent clear so Windows 11 DWM Mica/Acrylic backdrop renders
+            // natively without double-tinting (matching Start Menu, Alt+Tab, and Control Center).
+            d2d_color(0.0, 0.0, 0.0, 0.0)
         } else if is_dark {
-            d2d_color(0.12, 0.13, 0.15, 1.0)
+            // Fluent SolidBackgroundFillColorBase Dark (#202020), matching noren-wm.
+            d2d_color(32.0 / 255.0, 32.0 / 255.0, 32.0 / 255.0, 1.0)
         } else {
-            d2d_color(0.96, 0.96, 0.97, 1.0)
+            // Fluent SolidBackgroundFillColorBase Light (#F3F3F3), matching noren-wm.
+            d2d_color(243.0 / 255.0, 243.0 / 255.0, 243.0 / 255.0, 1.0)
         };
         let text_col = if is_dark {
-            d2d_color(0.95, 0.96, 0.98, 1.0)
+            d2d_color(1.0, 1.0, 1.0, 1.0)
         } else {
-            d2d_color(0.10, 0.11, 0.13, 1.0)
+            d2d_color(0.10, 0.10, 0.10, 1.0)
         };
         let muted_col = if is_dark {
-            d2d_color(0.65, 0.68, 0.73, 1.0)
+            d2d_color(1.0, 1.0, 1.0, 0.62)
         } else {
-            d2d_color(0.42, 0.44, 0.49, 1.0)
+            d2d_color(0.0, 0.0, 0.0, 0.56)
         };
         let accent_col = rgb_to_d2d(self.theme.accent_rgb, 1.0);
         let divider_col = if is_dark {
