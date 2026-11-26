@@ -465,6 +465,8 @@ struct AppState {
     cursor: usize,
     selected: usize,
     scroll_offset: usize,
+    wheel_accum: i32,
+    last_mouse_pos: Option<(i16, i16)>,
     results: Vec<SearchItem>,
     confirm: ConfirmationState,
     visible: bool,
@@ -740,6 +742,8 @@ impl AppState {
         self.cursor = 0;
         self.selected = 0;
         self.scroll_offset = 0;
+        self.wheel_accum = 0;
+        self.last_mouse_pos = None;
         self.confirm.clear();
         if let Some(ref nip) = self.nip {
             self.remote_actions = nip.remote_actions();
@@ -1081,6 +1085,26 @@ impl AppState {
             } else if self.selected >= self.scroll_offset + max_rows {
                 self.scroll_offset = self.selected + 1 - max_rows;
             }
+            self.confirm.clear();
+            self.invalidate();
+        }
+    }
+
+    fn scroll_list_viewport(&mut self, delta_rows: isize) {
+        if self.results.is_empty() || delta_rows == 0 {
+            return;
+        }
+        let max_rows = self.cfg.max_visible_rows.max(1);
+        let (next_offset, next_selected) = compute_wheel_scroll(
+            self.scroll_offset,
+            self.selected,
+            self.results.len(),
+            max_rows,
+            delta_rows,
+        );
+        if next_offset != self.scroll_offset || next_selected != self.selected {
+            self.scroll_offset = next_offset;
+            self.selected = next_selected;
             self.confirm.clear();
             self.invalidate();
         }
@@ -2261,8 +2285,14 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_MOUSEMOVE => {
             if let Some(st) = state_mut() {
-                let x = (lparam.0 & 0xFFFF) as i16 as f32;
-                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+                let ix = (lparam.0 & 0xFFFF) as i16;
+                let iy = ((lparam.0 >> 16) & 0xFFFF) as i16;
+                if st.last_mouse_pos == Some((ix, iy)) {
+                    return LRESULT(0);
+                }
+                st.last_mouse_pos = Some((ix, iy));
+                let x = ix as f32;
+                let y = iy as f32;
                 if st.view == View::Wallpaper {
                     let hit = st.hit_test_carousel(x, y);
                     if hit != st.wp.hovered_v {
@@ -2274,11 +2304,14 @@ unsafe extern "system" fn wnd_proc(
                     let list_top = SEARCH_BAR_H * scale + 1.0 + LIST_PAD_Y * scale;
                     if y >= list_top {
                         let slot = ((y - list_top) / (ROW_H * scale)) as usize;
-                        let idx = st.scroll_offset + slot;
-                        if idx < st.results.len() && idx != st.selected {
-                            st.selected = idx;
-                            st.confirm.clear();
-                            st.invalidate();
+                        let max_rows = st.cfg.max_visible_rows.max(1);
+                        if slot < max_rows {
+                            let idx = st.scroll_offset + slot;
+                            if idx < st.results.len() && idx != st.selected {
+                                st.selected = idx;
+                                st.confirm.clear();
+                                st.invalidate();
+                            }
                         }
                     }
                 }
@@ -2325,10 +2358,15 @@ unsafe extern "system" fn wnd_proc(
                             st.step_carousel(1);
                         }
                     }
-                } else if delta > 0 {
-                    st.move_selection(-1);
-                } else if delta < 0 {
-                    st.move_selection(1);
+                } else {
+                    st.wheel_accum = st.wheel_accum.saturating_add(delta as i32);
+                    // 60 units per row: 1 standard wheel notch (120) scrolls 2 rows,
+                    // while precision touchpads accumulate smoothly without skipping.
+                    let steps = st.wheel_accum / 60;
+                    if steps != 0 {
+                        st.wheel_accum -= steps * 60;
+                        st.scroll_list_viewport(-(steps as isize));
+                    }
                 }
             }
             LRESULT(0)
@@ -2423,6 +2461,8 @@ pub fn run() -> Result<(), String> {
         cursor: 0,
         selected: 0,
         scroll_offset: 0,
+        wheel_accum: 0,
+        last_mouse_pos: None,
         results: Vec::new(),
         confirm: ConfirmationState::default(),
         visible: false,
@@ -2460,9 +2500,48 @@ pub fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn compute_wheel_scroll(
+    scroll_offset: usize,
+    selected: usize,
+    total_len: usize,
+    max_rows: usize,
+    delta_rows: isize,
+) -> (usize, usize) {
+    if total_len == 0 || delta_rows == 0 {
+        return (scroll_offset, selected);
+    }
+    let max_rows = max_rows.max(1);
+    let max_offset = total_len.saturating_sub(max_rows);
+    if max_offset == 0 {
+        let next_sel = (selected as isize + delta_rows).clamp(0, (total_len - 1) as isize) as usize;
+        return (0, next_sel);
+    }
+    let next_offset = (scroll_offset as isize + delta_rows).clamp(0, max_offset as isize) as usize;
+    let visible_end = (next_offset + max_rows).min(total_len) - 1;
+    let next_sel = selected.clamp(next_offset, visible_end);
+    (next_offset, next_sel)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_scroll_moves_viewport_directly_and_keeps_selection_visible() {
+        // Long list (50 items, 8 visible): scrolling down immediately advances scroll_offset.
+        let (off, sel) = compute_wheel_scroll(0, 2, 50, 8, 2);
+        assert_eq!(off, 2);
+        assert_eq!(sel, 2);
+
+        let (off2, sel2) = compute_wheel_scroll(2, 2, 50, 8, 3);
+        assert_eq!(off2, 5);
+        assert_eq!(sel2, 5);
+
+        // Short list (5 items, 8 visible): moves selection instead.
+        let (off3, sel3) = compute_wheel_scroll(0, 1, 5, 8, 2);
+        assert_eq!(off3, 0);
+        assert_eq!(sel3, 3);
+    }
 
     #[test]
     fn panel_geometry_positions_at_25_percent_and_scales_rows() {
