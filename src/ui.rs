@@ -961,7 +961,7 @@ impl AppState {
         None
     }
 
-    fn execute_selected(&mut self, ctrl_held: bool) {
+    fn execute_selected(&mut self, ctrl_held: bool, shift_held: bool, alt_held: bool) {
         let Some(item) = self.results.get(self.selected).cloned() else {
             return;
         };
@@ -969,6 +969,13 @@ impl AppState {
             self.invalidate();
             return;
         }
+        let hint_mode = if shift_held {
+            Some("float")
+        } else if alt_held {
+            Some("empty_slot")
+        } else {
+            None
+        };
         match item.effect {
             ItemEffect::FillQuery { text } => {
                 self.query = text;
@@ -981,14 +988,25 @@ impl AppState {
             }
             ItemEffect::LaunchApp { id } => {
                 self.frecency.record_launch(&id, now_unix_secs());
+                if let (Some(mode), Some(ref nip)) = (hint_mode, &self.nip) {
+                    nip.send_launch_hint(mode);
+                }
                 self.hide_launcher();
                 let _ = launch_app(&id);
             }
             ItemEffect::OpenWebUrl { url } => {
+                if let (Some(mode), Some(ref nip)) = (hint_mode, &self.nip) {
+                    nip.send_launch_hint(mode);
+                }
                 self.hide_launcher();
                 let _ = open_url_in_browser(&url);
             }
             ItemEffect::OpenFile { path } => {
+                if !ctrl_held {
+                    if let (Some(mode), Some(ref nip)) = (hint_mode, &self.nip) {
+                        nip.send_launch_hint(mode);
+                    }
+                }
                 self.hide_launcher();
                 if ctrl_held {
                     let _ = reveal_in_explorer(&path);
@@ -2166,7 +2184,18 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_SYSCHAR => LRESULT(0),
         WM_SYSKEYDOWN | WM_SYSKEYUP => {
-            if wparam.0 as u16 == VK_MENU.0 {
+            let vk = wparam.0 as u16;
+            if vk == VK_MENU.0 {
+                return LRESULT(0);
+            }
+            if msg == WM_SYSKEYDOWN && vk == VK_RETURN.0 {
+                if let Some(st) = state_mut() {
+                    if st.view == View::Search {
+                        let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+                        let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
+                        st.execute_selected(ctrl, shift, true);
+                    }
+                }
                 return LRESULT(0);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -2176,7 +2205,7 @@ unsafe extern "system" fn wnd_proc(
                 let vk = wparam.0 as u16;
                 let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
                 let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
-                let _ = shift;
+                let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
 
                 if st.view == View::Wallpaper {
                     let count = st.wp.scan.as_ref().map(|s| s.items.len()).unwrap_or(0);
@@ -2213,7 +2242,7 @@ unsafe extern "system" fn wnd_proc(
                     x if x == VK_ESCAPE.0 => st.hide_launcher(),
                     x if x == VK_RETURN.0 => {
                         if st.view == View::Search {
-                            st.execute_selected(ctrl);
+                            st.execute_selected(ctrl, shift, alt);
                         }
                     }
                     x if x == VK_TAB.0 => {
@@ -2349,7 +2378,9 @@ unsafe extern "system" fn wnd_proc(
                         if idx < st.results.len() {
                             st.selected = idx;
                             let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
-                            st.execute_selected(ctrl);
+                            let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
+                            let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
+                            st.execute_selected(ctrl, shift, alt);
                         }
                     }
                 }

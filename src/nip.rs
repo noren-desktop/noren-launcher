@@ -234,6 +234,22 @@ impl LauncherNipRuntime {
         });
     }
 
+    /// Send a one-shot launch placement hint (`"float"` or `"empty_slot"`) to `noren-wm`
+    /// right before launching an app/file/URL. No-op if `noren-wm` is not running.
+    pub fn send_launch_hint(&self, mode: &str) {
+        let has_wm = self.node.peers().iter().any(|p| p.module == "wm");
+        if !has_wm {
+            return;
+        }
+        let _ = self.node.send_cmd(
+            "wm",
+            "window.control",
+            "launch.hint",
+            json!({ "mode": mode, "ttl_ms": 6000 }),
+            Duration::from_millis(180),
+        );
+    }
+
     pub fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Release);
         self.tray.shutdown();
